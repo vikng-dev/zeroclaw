@@ -2816,10 +2816,10 @@ impl Channel for WhatsAppWebChannel {
                                 ) {
                                     match client.profile().set_push_name(desired).await {
                                         Ok(()) => {
-                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("set WhatsApp push name to {:?} (was {:?})", desired, device.push_name));
+                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("set WhatsApp push name (configured len={}, previous len={})", desired.len(), device.push_name.len()));
                                         }
                                         Err(e) => {
-                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to set WhatsApp push name to {desired:?}; keeping the account's current name: {e}"));
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to set WhatsApp push name (configured len={}); keeping the account's current name: {e}", desired.len()));
                                         }
                                     }
                                 }
@@ -4689,7 +4689,7 @@ mod tests {
                 Arc::new(Vec::new),
             )
         };
-        assert_eq!(mk(Some("רוני")).push_name.as_deref(), Some("רוני"));
+        assert_eq!(mk(Some("סוכן")).push_name.as_deref(), Some("סוכן"));
         assert_eq!(mk(None).push_name, None);
     }
 
@@ -4697,8 +4697,8 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn push_name_to_apply_sends_only_on_a_real_difference() {
         // Multi-byte throughout, so any byte-slicing of the value shows up here.
-        let hebrew = "רוני – עוזרת אישית";
-        assert!(hebrew.len() > hebrew.chars().count());
+        let non_ascii = "סוכן – שירות";
+        assert!(non_ascii.len() > non_ascii.chars().count());
 
         // (configured, name the device announces, name to send)
         let cases: [(Option<&str>, &str, Option<&str>); 11] = [
@@ -4706,13 +4706,15 @@ mod tests {
             (None, "", None),
             (Some(""), "Old", None),
             (Some("   \t "), "Old", None),
-            (Some("Roni"), "Galaxy S21", Some("Roni")),
-            (Some("Roni"), "", Some("Roni")),
-            (Some("Roni"), "Roni", None),
-            (Some("  Roni  "), "Roni", None),
-            (Some(hebrew), "Galaxy S21", Some(hebrew)),
-            (Some(hebrew), hebrew, None),
-            (Some("רוני"), "רונית", Some("רוני")),
+            (Some("ZeroClawAgent"), "Galaxy S21", Some("ZeroClawAgent")),
+            (Some("ZeroClawAgent"), "", Some("ZeroClawAgent")),
+            (Some("ZeroClawAgent"), "ZeroClawAgent", None),
+            (Some("  ZeroClawAgent  "), "ZeroClawAgent", None),
+            (Some(non_ascii), "Galaxy S21", Some(non_ascii)),
+            (Some(non_ascii), non_ascii, None),
+            // A value that is a strict byte-prefix of the device's name is
+            // still a difference.
+            (Some("סוכן"), "סוכנת", Some("סוכן")),
         ];
         for (configured, current, want) in cases {
             assert_eq!(
