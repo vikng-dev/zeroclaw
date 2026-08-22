@@ -27681,7 +27681,7 @@ bot_token = "xoxb-tok"
         let parsed: WhatsAppConfig = serde_json::from_str("{}").unwrap();
         assert!(parsed.push_name.is_none());
 
-        let name = "רוני – עוזרת אישית";
+        let name = "סוכן – שירות";
         let wc = WhatsAppConfig {
             push_name: Some(name.into()),
             ..Default::default()
@@ -27693,7 +27693,7 @@ bot_token = "xoxb-tok"
     #[test]
     async fn whatsapp_config_push_name_is_not_a_web_selector() {
         let wc = WhatsAppConfig {
-            push_name: Some("Roni".into()),
+            push_name: Some("ZeroClawAgent".into()),
             ..Default::default()
         };
         assert!(!wc.has_web_selector());
