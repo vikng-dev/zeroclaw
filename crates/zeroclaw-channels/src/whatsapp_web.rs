@@ -1062,6 +1062,7 @@ impl WhatsAppWebChannel {
         content: String,
         attachments: Vec<MediaAttachment>,
         passive_context: bool,
+        explicitly_addressed: bool,
         conversation_scope: ChannelConversationScope,
     ) {
         if let Err(e) = tx
@@ -1085,7 +1086,7 @@ impl WhatsAppWebChannel {
                 subject: None,
                 internal_sop_event: None,
                 passive_context,
-                explicitly_addressed: false,
+                explicitly_addressed,
                 conversation_scope,
             })
             .await
@@ -1443,6 +1444,27 @@ impl WhatsAppWebChannel {
         let mentioned_jids = Self::extract_mentioned_jids(msg);
         Self::contains_bot_mention(text, &mentioned_jids, bot_phone, bot_lid)
             || Self::is_reply_to_bot(msg, bot_phone, bot_lid)
+    }
+
+    /// `is_message_addressed_to_bot` against the live bot identity, or `None`
+    /// while that identity is still unknown and the question has no answer.
+    #[cfg(feature = "whatsapp-web")]
+    fn addressed_to_bot(
+        msg: &waproto::whatsapp::Message,
+        text: &str,
+        bot_phone: &Mutex<Option<String>>,
+        bot_lid: &Mutex<Option<String>>,
+    ) -> Option<bool> {
+        let bot_phone = bot_phone.lock();
+        let bot_lid = bot_lid.lock();
+        (bot_phone.is_some() || bot_lid.is_some()).then(|| {
+            Self::is_message_addressed_to_bot(
+                msg,
+                text,
+                bot_phone.as_deref().unwrap_or(""),
+                bot_lid.as_deref(),
+            )
+        })
     }
 }
 
@@ -2305,14 +2327,18 @@ impl Channel for WhatsAppWebChannel {
                                 // passive context when explicitly enabled; otherwise they keep
                                 // the existing drop behavior. This runs before STT/media
                                 // downloads so passive messages have no provider/tool side effects.
+                                // Computed unconditionally: the mention_only
+                                // gate below consumes it, and the orchestrator's
+                                // reply-intent precheck needs the same answer
+                                // even when that gate is off.
+                                let addressed = Self::addressed_to_bot(
+                                    msg,
+                                    &content,
+                                    &bot_phone_inner,
+                                    &bot_lid_inner,
+                                );
                                 if mention_only && is_group {
-                                    let bot_phone = bot_phone_inner.lock();
-                                    let bot_lid = bot_lid_inner.lock();
-                                    if bot_phone.is_some() || bot_lid.is_some() {
-                                        let bp = bot_phone.as_deref().unwrap_or("");
-                                        let bl = bot_lid.as_deref();
-                                        let addressed =
-                                            Self::is_message_addressed_to_bot(msg, &content, bp, bl);
+                                    if let Some(addressed) = addressed {
                                         if Self::should_record_passive_group_context(
                                             passive_group_context,
                                             is_group,
@@ -2328,6 +2354,7 @@ impl Channel for WhatsAppWebChannel {
                                         return;
                                     }
                                 }
+                                let explicitly_addressed = addressed.unwrap_or(false);
 
                                 let passive_from_mention_gating_possible =
                                     Self::should_record_passive_group_context(
@@ -2368,6 +2395,7 @@ impl Channel for WhatsAppWebChannel {
                                         ),
                                         Vec::new(),
                                         true,
+                                        explicitly_addressed,
                                         conversation_scope,
                                     )
                                     .await;
@@ -2467,6 +2495,7 @@ impl Channel for WhatsAppWebChannel {
                                     ),
                                     attachments,
                                     false,
+                                    explicitly_addressed,
                                     conversation_scope,
                                 )
                                 .await;
@@ -4064,6 +4093,32 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::extract_mentioned_jids(&msg),
             vec!["100@s.whatsapp.net".to_string()]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn addressed_to_bot_is_none_until_the_bot_identity_is_known() {
+        let msg = extended_text_reply("200@lid", &[]);
+        let text = "expand the previous response";
+
+        let (no_phone, no_lid) = (Mutex::new(None), Mutex::new(None));
+        assert_eq!(
+            WhatsAppWebChannel::addressed_to_bot(&msg, text, &no_phone, &no_lid),
+            None
+        );
+
+        let phone = Mutex::new(Some("100".to_string()));
+        let lid = Mutex::new(Some("200".to_string()));
+        assert_eq!(
+            WhatsAppWebChannel::addressed_to_bot(&msg, text, &phone, &lid),
+            Some(true)
+        );
+
+        let other_lid = Mutex::new(Some("999".to_string()));
+        assert_eq!(
+            WhatsAppWebChannel::addressed_to_bot(&msg, text, &phone, &other_lid),
+            Some(false)
         );
     }
 
