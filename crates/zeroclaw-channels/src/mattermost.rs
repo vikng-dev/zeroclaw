@@ -2612,6 +2612,7 @@ mod tests {
                     bearer_token: Some("test_token".to_string()),
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
+                    ..Default::default()
                 }),
                 transcribe_non_ptt_audio: false,
             });
@@ -2667,6 +2668,7 @@ mod tests {
                     bearer_token: Some("test_token".to_string()),
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
+                    ..Default::default()
                 }),
                 transcribe_non_ptt_audio: false,
             });

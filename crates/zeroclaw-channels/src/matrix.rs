@@ -3847,6 +3847,7 @@ mod tests {
                 bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
                 timeout_secs: 30,
+                ..Default::default()
             }
         }
 
@@ -3918,6 +3919,7 @@ mod tests {
                 bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
                 timeout_secs: 30,
+                ..Default::default()
             }
         }
 
@@ -4237,6 +4239,7 @@ mod tests {
                         bearer_token: Some("test-token".to_string()),
                         max_audio_bytes: 10 * 1024 * 1024,
                         timeout_secs: 30,
+                        ..Default::default()
                     }),
                     ..TranscriptionConfig::default()
                 })),

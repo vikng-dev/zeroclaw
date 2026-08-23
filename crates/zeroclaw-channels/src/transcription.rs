@@ -736,14 +736,16 @@ pub struct LocalWhisperProvider {
     alias: String,
     url: String,
     bearer_token: String,
+    model: Option<String>,
+    language: Option<String>,
     max_audio_bytes: usize,
     timeout_secs: u64,
 }
 
 impl LocalWhisperProvider {
-    /// Build from config. Fails if `url` or `bearer_token` is empty, if `url`
-    /// is not a valid HTTP/HTTPS URL (scheme must be `http` or `https`), if
-    /// `max_audio_bytes` is zero, or if `timeout_secs` is zero.
+    /// Build from config. Fails if `url` or `bearer_token` is empty or unset,
+    /// if `url` is not a valid HTTP/HTTPS URL (scheme must be `http` or
+    /// `https`), if `max_audio_bytes` is zero, or if `timeout_secs` is zero.
     pub fn from_config(
         alias: &str,
         config: &zeroclaw_config::schema::LocalWhisperConfig,
@@ -779,6 +781,8 @@ impl LocalWhisperProvider {
             alias: alias.to_string(),
             url,
             bearer_token,
+            model: non_empty(config.model.as_deref()),
+            language: non_empty(config.language.as_deref()),
             max_audio_bytes: config.max_audio_bytes,
             timeout_secs: config.timeout_secs,
         })
@@ -794,11 +798,20 @@ impl LocalWhisperProvider {
         let bridge = zeroclaw_config::schema::LocalWhisperConfig {
             url: cfg.uri.clone(),
             bearer_token: cfg.bearer_token.clone(),
+            model: cfg.model.clone(),
+            language: cfg.language.clone(),
             max_audio_bytes: cfg.max_audio_bytes,
             timeout_secs: cfg.timeout_secs,
         };
         Self::from_config(alias, &bridge)
     }
+}
+
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[async_trait]
@@ -828,10 +841,20 @@ impl TranscriptionProvider for LocalWhisperProvider {
             .file_name(normalized_name)
             .mime_str(mime)?;
 
+        let mut form = Form::new().part("file", file_part);
+        // OpenAI-compatible `/audio/transcriptions` endpoints reject a request
+        // without `model`; single-model local servers ignore both fields.
+        if let Some(ref model) = self.model {
+            form = form.text("model", model.clone());
+        }
+        if let Some(ref language) = self.language {
+            form = form.text("language", language.clone());
+        }
+
         let resp = client
             .post(&self.url)
             .bearer_auth(&self.bearer_token)
-            .multipart(Form::new().part("file", file_part))
+            .multipart(form)
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .send()
             .await
@@ -1842,6 +1865,7 @@ mod tests {
             bearer_token: Some("test-token".to_string()),
             max_audio_bytes: 10 * 1024 * 1024,
             timeout_secs: 30,
+            ..Default::default()
         }
     }
 
@@ -2345,6 +2369,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "auth ok");
+    }
+
+    #[tokio::test]
+    async fn local_whisper_sends_model_and_language_when_set() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/audio/transcriptions"))
+            .and(body_string_contains("name=\"model\""))
+            .and(body_string_contains("whisper-1"))
+            .and(body_string_contains("name=\"language\""))
+            .and(body_string_contains("he"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "שלום"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg =
+            local_whisper_config(&format!("{}/api/v1/audio/transcriptions", server.uri()));
+        cfg.model = Some("whisper-1".to_string());
+        cfg.language = Some("he".to_string());
+        let transcription_provider =
+            LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
+
+        let result = transcription_provider
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap();
+        assert_eq!(result, "שלום");
+    }
+
+    #[tokio::test]
+    async fn local_whisper_omits_model_and_language_when_unset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .and(|req: &Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                !body.contains("name=\"model\"") && !body.contains("name=\"language\"")
+            })
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "bare"})),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
+        let transcription_provider =
+            LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
+
+        let result = transcription_provider
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap();
+        assert_eq!(result, "bare");
     }
 
     #[tokio::test]

@@ -5600,6 +5600,9 @@ pub struct LocalWhisperTranscriptionProviderConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
+    /// Optional model name (passed through to the local endpoint).
+    #[serde(default)]
+    pub model: Option<String>,
     /// Optional language hint (passed through to the local endpoint).
     #[serde(default)]
     pub language: Option<String>,
@@ -5633,6 +5636,7 @@ impl Default for LocalWhisperTranscriptionProviderConfig {
         Self {
             uri: String::new(),
             bearer_token: None,
+            model: None,
             language: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
@@ -5767,13 +5771,22 @@ pub struct GoogleSttConfig {
 pub struct LocalWhisperConfig {
     /// HTTP or HTTPS endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
     pub url: String,
-    /// Bearer token for endpoint authentication.
-    /// Omit for unauthenticated local endpoints.
+    /// Bearer token for endpoint authentication. Required — a local endpoint
+    /// that authenticates nothing still needs a placeholder value.
     #[serde(default)]
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
+    /// Optional model name, sent as the `model` multipart field. Required by
+    /// OpenAI-compatible `/audio/transcriptions` endpoints (e.g. `"whisper-1"`),
+    /// omitted for endpoints that serve a single fixed model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional language hint (ISO-639-1, e.g. `"en"`), sent as the `language`
+    /// multipart field.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB — matching the cloud API cap for a safe out-of-the-box
     /// experience. Self-hosted endpoints can accept much larger files; raise this
@@ -5810,6 +5823,8 @@ impl Default for LocalWhisperConfig {
         Self {
             url: String::new(),
             bearer_token: None,
+            model: None,
+            language: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
