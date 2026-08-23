@@ -2644,7 +2644,11 @@ impl Channel for WhatsAppWebChannel {
             }
 
             let mut bot = builder.build().await?;
-            *self.client.lock() = Some(bot.client());
+            let client = bot.client();
+            // A bot never announces presence, which would otherwise downgrade every
+            // delivery receipt to `type="inactive"` and drop the delivered ticks.
+            client.set_force_active_delivery_receipts(true);
+            *self.client.lock() = Some(client);
 
             // Run the bot
             let bot_handle = bot.run().await?;
