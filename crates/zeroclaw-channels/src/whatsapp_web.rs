@@ -821,6 +821,18 @@ impl WhatsAppWebChannel {
         }
     }
 
+    /// `[Marker]`, or `[Marker]\n\n<caption>` when the media carries one —
+    /// the shape the Telegram channel already uses for captioned attachments.
+    /// `text_content()` never reads a caption, so without this the question
+    /// an operator typed alongside a photo is dropped.
+    #[cfg(feature = "whatsapp-web")]
+    fn captioned_marker(marker: &str, caption: Option<&str>) -> String {
+        match caption.map(str::trim).filter(|c| !c.is_empty()) {
+            Some(caption) => format!("{marker}\n\n{caption}"),
+            None => marker.to_string(),
+        }
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn media_fallback_content(content: String, msg: &waproto::whatsapp::Message) -> String {
         if !content.is_empty() {
@@ -833,14 +845,14 @@ impl WhatsAppWebChannel {
         if base.sticker_message.is_some() {
             return "[Sticker]".to_string();
         }
-        if base.image_message.is_some() {
-            return "[Image]".to_string();
+        if let Some(ref image) = base.image_message {
+            return Self::captioned_marker("[Image]", image.caption.as_deref());
         }
-        if base.video_message.is_some() {
-            return "[Video]".to_string();
+        if let Some(ref video) = base.video_message {
+            return Self::captioned_marker("[Video]", video.caption.as_deref());
         }
-        if base.document_message.is_some() {
-            return "[Document]".to_string();
+        if let Some(ref document) = base.document_message {
+            return Self::captioned_marker("[Document]", document.caption.as_deref());
         }
         if let Some(ref loc) = base.location_message {
             // Live locations are silently ignored — they stream
@@ -3713,6 +3725,35 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::media_fallback_content("hello".to_string(), &msg),
             "hello"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_keeps_the_caption() {
+        let msg = waproto::whatsapp::Message {
+            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                caption: Some("  what is wrong with this?  ".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            "[Image]\n\nwhat is wrong with this?"
+        );
+
+        // A blank caption stays at the bare marker.
+        let msg = waproto::whatsapp::Message {
+            video_message: Some(Box::new(waproto::whatsapp::message::VideoMessage {
+                caption: Some("   ".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            "[Video]"
         );
     }
 
