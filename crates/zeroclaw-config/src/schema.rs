@@ -6398,6 +6398,11 @@ pub struct MediaPipelineConfig {
     /// Summarize video attachments (placeholder — requires external API).
     #[serde(default = "default_true")]
     pub summarize_video: bool,
+
+    /// Announce document attachments (name, type and size) so the agent knows
+    /// a file arrived and can ask for or fetch it.
+    #[serde(default = "default_true")]
+    pub announce_documents: bool,
 }
 
 impl Default for MediaPipelineConfig {
@@ -6407,6 +6412,7 @@ impl Default for MediaPipelineConfig {
             transcribe_audio: true,
             describe_images: true,
             summarize_video: true,
+            announce_documents: true,
         }
     }
 }

@@ -773,6 +773,34 @@ impl WhatsAppWebChannel {
         }
     }
 
+    /// Longest sender-supplied document name kept as the attachment name.
+    #[cfg(feature = "whatsapp-web")]
+    const DOCUMENT_NAME_MAX_CHARS: usize = 100;
+
+    /// A bare, bounded file name for a document. The sender chooses this
+    /// string, so path separators and control characters are stripped before
+    /// it reaches anything that might write it out.
+    #[cfg(feature = "whatsapp-web")]
+    fn document_file_name(supplied: Option<&str>, mime: &str) -> String {
+        let base_name = supplied
+            .unwrap_or_default()
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default();
+        let cleaned: String = base_name
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(Self::DOCUMENT_NAME_MAX_CHARS)
+            .collect();
+        let cleaned = cleaned.trim().trim_start_matches('.').trim();
+
+        if cleaned.is_empty() {
+            format!("whatsapp-document.{}", Self::mime_extension(mime, "bin"))
+        } else {
+            cleaned.to_string()
+        }
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn mime_extension(mime: &str, fallback: &str) -> String {
         let subtype = mime
@@ -890,6 +918,28 @@ impl WhatsAppWebChannel {
             Self::push_downloaded_attachment(
                 client,
                 audio.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref document) = base.document_message {
+            let mime = document
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let file_name = format!(
+                "{file_prefix}{}",
+                Self::document_file_name(
+                    document.file_name.as_deref().or(document.title.as_deref()),
+                    &mime,
+                )
+            );
+            Self::push_downloaded_attachment(
+                client,
+                document.as_ref() as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -3817,6 +3867,46 @@ mod tests {
             ),
             "[Reply to 972532445442: delete sections 2 and 3]\n\
              what am I referencing?"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn document_file_name_is_bare_bounded_and_always_present() {
+        assert_eq!(
+            WhatsAppWebChannel::document_file_name(Some("invoice.pdf"), "application/pdf"),
+            "invoice.pdf"
+        );
+        // The sender picks this string: keep the basename only.
+        assert_eq!(
+            WhatsAppWebChannel::document_file_name(
+                Some("../../etc/passwd"),
+                "application/octet-stream"
+            ),
+            "passwd"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::document_file_name(Some("a\\b\\c.docx"), "application/msword"),
+            "c.docx"
+        );
+        // Missing, blank, or dot-only names fall back to the MIME subtype.
+        assert_eq!(
+            WhatsAppWebChannel::document_file_name(None, "application/pdf"),
+            "whatsapp-document.pdf"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::document_file_name(Some("  "), "application/octet-stream"),
+            "whatsapp-document.octet-stream"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::document_file_name(Some("..."), ""),
+            "whatsapp-document.bin"
+        );
+
+        let long = WhatsAppWebChannel::document_file_name(Some(&"n".repeat(500)), "text/plain");
+        assert_eq!(
+            long.chars().count(),
+            WhatsAppWebChannel::DOCUMENT_NAME_MAX_CHARS
         );
     }
 

@@ -58,6 +58,9 @@ impl<'a> MediaPipeline<'a> {
                     let annotation = self.process_video(attachment);
                     annotations.push(annotation);
                 }
+                MediaKind::Document if self.config.announce_documents => {
+                    annotations.push(Self::process_document(attachment));
+                }
                 _ => {}
             }
         }
@@ -127,6 +130,18 @@ impl<'a> MediaPipeline<'a> {
     fn process_video(&self, attachment: &MediaAttachment) -> String {
         format!("[Video: {} attached]", attachment.file_name)
     }
+
+    /// Announce a document. There is no extraction step: the point is that the
+    /// agent learns a file arrived and what it is, instead of reading a bare
+    /// `[Document]` marker with no name, type or size behind it.
+    fn process_document(attachment: &MediaAttachment) -> String {
+        let mut annotation = format!("[Document: {} attached", attachment.file_name);
+        if let Some(ref mime) = attachment.mime_type {
+            annotation.push_str(&format!(", type {mime}"));
+        }
+        annotation.push_str(&format!(", {} bytes]", attachment.data.len()));
+        annotation
+    }
 }
 
 fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {
@@ -182,6 +197,7 @@ mod tests {
             transcribe_audio: true,
             describe_images: true,
             summarize_video: true,
+            announce_documents: true,
         }
     }
 
@@ -198,6 +214,14 @@ mod tests {
             file_name: "photo.jpg".to_string(),
             data: vec![0u8; 50],
             mime_type: Some("image/jpeg".to_string()),
+        }
+    }
+
+    fn sample_document() -> MediaAttachment {
+        MediaAttachment {
+            file_name: "invoice.pdf".to_string(),
+            data: vec![0u8; 4096],
+            mime_type: Some("application/pdf".to_string()),
         }
     }
 
@@ -393,11 +417,31 @@ mod tests {
             transcribe_audio: false,
             describe_images: false,
             summarize_video: false,
+            announce_documents: false,
         };
         let pipeline = MediaPipeline::new(&config, None, false);
 
-        let attachments = vec![sample_audio(), sample_image(), sample_video()];
+        let attachments = vec![
+            sample_audio(),
+            sample_image(),
+            sample_video(),
+            sample_document(),
+        ];
         let result = pipeline.process("hello", &attachments).await;
         assert_eq!(result, "hello");
+    }
+
+    #[tokio::test]
+    async fn documents_are_announced_with_name_type_and_size() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, false);
+
+        let result = pipeline
+            .process("please read it", &[sample_document()])
+            .await;
+        assert_eq!(
+            result,
+            "[Document: invoice.pdf attached, type application/pdf, 4096 bytes]\n\nplease read it"
+        );
     }
 }

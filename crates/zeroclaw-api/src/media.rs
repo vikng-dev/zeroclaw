@@ -4,6 +4,9 @@ pub enum MediaKind {
     Audio,
     Image,
     Video,
+    /// A file the model cannot interpret from its bytes alone (PDF, office
+    /// document, archive, plain text) but should still be told about.
+    Document,
     Unknown,
 }
 
@@ -93,9 +96,21 @@ impl MediaAttachment {
                 MediaKind::Image
             }
             "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" => MediaKind::Video,
+            "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+            | "rtf" | "txt" | "md" | "csv" | "json" | "xml" | "zip" => MediaKind::Document,
+            // A document MIME type only decides once the extension has had its
+            // say: `application/octet-stream` is the generic binary type and
+            // routinely wraps audio and images.
+            _ if self.mime_type.as_deref().is_some_and(is_document_mime) => MediaKind::Document,
             _ => MediaKind::Unknown,
         }
     }
+}
+
+fn is_document_mime(mime: &str) -> bool {
+    let lower = mime.to_ascii_lowercase();
+    (lower.starts_with("text/") || lower.starts_with("application/"))
+        && !lower.starts_with("application/octet-stream")
 }
 
 #[cfg(test)]
@@ -140,13 +155,32 @@ mod tests {
             ("pic.HEIC", MediaKind::Image),
             ("clip.mp4", MediaKind::Video),
             ("movie.mkv", MediaKind::Video),
-            ("doc.pdf", MediaKind::Unknown),
+            ("doc.pdf", MediaKind::Document),
+            ("sheet.XLSX", MediaKind::Document),
             ("data.bin", MediaKind::Unknown),
             ("noextension", MediaKind::Unknown),
         ];
         for (name, want) in cases {
             assert_eq!(att(name, None).kind(), want, "{name}");
         }
+    }
+
+    #[test]
+    fn kind_uses_a_document_mime_only_when_the_extension_is_silent() {
+        assert_eq!(
+            att("statement", Some("application/pdf")).kind(),
+            MediaKind::Document
+        );
+        assert_eq!(att("notes", Some("text/plain")).kind(), MediaKind::Document);
+        // The generic binary type must not claim media the extension knows.
+        assert_eq!(
+            att("voice.ogg", Some("application/octet-stream")).kind(),
+            MediaKind::Audio
+        );
+        assert_eq!(
+            att("mystery", Some("application/octet-stream")).kind(),
+            MediaKind::Unknown
+        );
     }
 
     #[test]
