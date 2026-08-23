@@ -4676,9 +4676,15 @@ async fn process_channel_message_body(
         let transcription_manager = {
             let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
                 .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
+            // The agent's declared ref wins; an agent with no preference
+            // falls back to the sole registered provider, the same
+            // resolution the channels' own lanes use. Without the fallback
+            // every quoted/attachment audio bails on the empty alias while
+            // the direct voice-note lane transcribes fine.
             let m = base
                 .with_typed_providers(&ctx.prompt_config.providers.transcription)
-                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
+                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone())
+                .with_sole_provider();
             if m.available_providers().is_empty() {
                 None
             } else {

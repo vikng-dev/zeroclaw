@@ -1131,6 +1131,26 @@ impl TranscriptionManager {
         self.with_agent_transcription_provider(single_legacy_provider_alias(config))
     }
 
+    /// Bind the sole registered provider when the alias is still unbound.
+    ///
+    /// An empty alias means the agent expressed no preference, and with
+    /// exactly one provider registered there is nothing to prefer — the
+    /// dispatch is unambiguous, so an unbound `transcribe` bailing anyway is
+    /// a defect (the Matrix channel already resolves this way inline). Two
+    /// or more registered providers stay unbound: that choice is real and
+    /// must fail loud rather than be guessed.
+    #[must_use]
+    pub fn with_sole_provider(self) -> Self {
+        if !self.agent_transcription_provider.is_empty() {
+            return self;
+        }
+        let sole = match self.available_providers().as_slice() {
+            [only] => (*only).to_string(),
+            _ => return self,
+        };
+        self.with_agent_transcription_provider(sole)
+    }
+
     /// The alias `transcribe` dispatches to, empty when unbound.
     #[must_use]
     pub fn agent_transcription_provider(&self) -> &str {
@@ -2541,5 +2561,50 @@ mod tests {
             !err.contains("no transcription_provider configured"),
             "dotted alias must resolve; got: {err}"
         );
+    }
+
+    fn shell_with_providers(names: &[&str]) -> TranscriptionManager {
+        let mut transcription_providers: std::collections::HashMap<
+            String,
+            Box<dyn TranscriptionProvider>,
+        > = std::collections::HashMap::new();
+        for name in names {
+            let cfg = local_whisper_config("http://127.0.0.1:9/v1/transcribe");
+            transcription_providers.insert(
+                (*name).to_string(),
+                Box::new(LocalWhisperProvider::from_config(name, &cfg).unwrap()),
+            );
+        }
+        TranscriptionManager {
+            transcription_providers,
+            max_audio_bytes: None,
+            agent_transcription_provider: String::new(),
+        }
+    }
+
+    #[test]
+    fn with_sole_provider_binds_the_only_registered_provider() {
+        let manager = shell_with_providers(&["groq"]).with_sole_provider();
+        assert_eq!(manager.agent_transcription_provider(), "groq");
+    }
+
+    #[test]
+    fn with_sole_provider_leaves_an_ambiguous_set_unbound() {
+        let manager = shell_with_providers(&["groq", "openai.stt"]).with_sole_provider();
+        assert_eq!(manager.agent_transcription_provider(), "");
+    }
+
+    #[test]
+    fn with_sole_provider_never_overrides_a_declared_ref() {
+        let manager = shell_with_providers(&["groq"])
+            .with_agent_transcription_provider("openai.other")
+            .with_sole_provider();
+        assert_eq!(manager.agent_transcription_provider(), "openai.other");
+    }
+
+    #[test]
+    fn with_sole_provider_stays_unbound_with_nothing_registered() {
+        let manager = shell_with_providers(&[]).with_sole_provider();
+        assert_eq!(manager.agent_transcription_provider(), "");
     }
 }
