@@ -1138,12 +1138,28 @@ fn timestamp_channel_user_content(content: &str) -> String {
     format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
 }
 
-fn format_whatsapp_group_history_turn(label: &str, sender: &str, content: &str) -> String {
+/// `<display name> (<id>)` when the platform reported a name, otherwise the
+/// bare id. A group turn labelled with a phone number alone tells the model
+/// nothing about who is speaking.
+fn format_group_sender_attribution(sender: &str, display_name: Option<&str>) -> String {
+    match display_name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => format!("{name} ({sender})"),
+        None => sender.to_string(),
+    }
+}
+
+fn format_whatsapp_group_history_turn(
+    label: &str,
+    sender: &str,
+    display_name: Option<&str>,
+    content: &str,
+) -> String {
     let sender = sender.trim();
     if sender.is_empty() {
         format!("[{label}]\n{content}")
     } else {
-        format!("[{label} from {sender}]\n{content}")
+        let attribution = format_group_sender_attribution(sender, display_name);
+        format!("[{label} from {attribution}]\n{content}")
     }
 }
 
@@ -1153,7 +1169,12 @@ fn attributed_whatsapp_group_user_turn(
     content: &str,
 ) -> String {
     if msg.channel == "whatsapp" && is_group_reply_target(&msg.reply_target) {
-        format_whatsapp_group_history_turn(label, &msg.sender, content)
+        format_whatsapp_group_history_turn(
+            label,
+            &msg.sender,
+            msg.sender_display_name.as_deref(),
+            content,
+        )
     } else {
         content.to_string()
     }
@@ -13420,6 +13441,27 @@ api_key = "anthropic-key"
     }
 
     #[test]
+    fn group_history_turn_names_the_sender_when_the_channel_reports_one() {
+        assert_eq!(
+            format_whatsapp_group_history_turn("Label", "972500000000", Some("Hagar"), "hi"),
+            "[Label from Hagar (972500000000)]\nhi"
+        );
+        // No display name, or a blank one, keeps the pre-existing shape.
+        assert_eq!(
+            format_whatsapp_group_history_turn("Label", "972500000000", None, "hi"),
+            "[Label from 972500000000]\nhi"
+        );
+        assert_eq!(
+            format_whatsapp_group_history_turn("Label", "972500000000", Some("  "), "hi"),
+            "[Label from 972500000000]\nhi"
+        );
+        assert_eq!(
+            format_whatsapp_group_history_turn("Label", "", Some("Hagar"), "hi"),
+            "[Label]\nhi"
+        );
+    }
+
+    #[test]
     fn rollback_orphan_user_turn_removes_only_latest_matching_user_turn() {
         let sender = "telegram_u3".to_string();
         let mut histories =
@@ -23056,6 +23098,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-1".to_string(),
                 sender: "alice".to_string(),
+                sender_display_name: None,
                 reply_target: "chat-image".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),
@@ -24902,6 +24945,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-route".to_string(),
                 sender: "alice".to_string(),
+                sender_display_name: None,
                 reply_target: "chat-image-route".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),

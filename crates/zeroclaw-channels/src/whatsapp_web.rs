@@ -681,6 +681,98 @@ impl WhatsAppWebChannel {
         Self::extract_context_info(msg).and_then(|ctx| ctx.quoted_message.as_deref())
     }
 
+    /// Maximum quoted characters carried into the `[Reply to …]` prefix.
+    #[cfg(feature = "whatsapp-web")]
+    const QUOTED_REPLY_PREFIX_MAX_CHARS: usize = 200;
+
+    /// `[Reply to <id>: <quoted text>]` for a native WhatsApp reply, or `None`
+    /// when the message quotes nothing. Without it a bare "yes" in a busy group
+    /// reaches the model with no indication of what it answers — the quote is
+    /// in `ContextInfo`, which nothing else reads.
+    ///
+    /// `ContextInfo` names the quoted author by `participant` JID and carries
+    /// no push name, so the prefix states that id and leaves correlating it —
+    /// against the bot's own number, or the ids on group sender labels — to the
+    /// model. An id-less quote keeps the bare `[Reply to: …]`.
+    #[cfg(feature = "whatsapp-web")]
+    fn quoted_reply_prefix(msg: &waproto::whatsapp::Message) -> Option<String> {
+        use wacore::proto_helpers::MessageExt;
+
+        let ctx = Self::extract_context_info(msg)?;
+        let quoted = ctx.quoted_message.as_deref()?;
+        let text = Self::media_fallback_content(
+            quoted.text_content().unwrap_or("").trim().to_string(),
+            quoted,
+        );
+        // One line: the prefix sits above the message body, and a multi-line
+        // quote would read as part of it.
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            return None;
+        }
+        let author = ctx
+            .participant
+            .as_deref()
+            .map(Self::jid_digits)
+            .filter(|id| !id.is_empty())
+            .map(|id| format!(" {id}"))
+            .unwrap_or_default();
+        Some(format!(
+            "[Reply to{author}: {}]",
+            crate::util::truncate_with_ellipsis(&text, Self::QUOTED_REPLY_PREFIX_MAX_CHARS)
+        ))
+    }
+
+    /// Prepend the reply prefix to a turn body, when there is one to prepend.
+    #[cfg(feature = "whatsapp-web")]
+    fn with_quoted_reply_prefix(content: String, msg: &waproto::whatsapp::Message) -> String {
+        match Self::quoted_reply_prefix(msg) {
+            Some(prefix) => format!("{prefix}\n{content}"),
+            None => content,
+        }
+    }
+
+    /// `[Your id: <digits>[, <digits>]]` — the bot's own phone and LID as the
+    /// live session knows them, or `None` before the session resolves either.
+    ///
+    /// Sender labels and reply prefixes state ids; the model can only answer
+    /// "is that one me?" if its own ids are in the turn too. They come from
+    /// session state rather than an authored identity file so they cannot go
+    /// stale or belong to another instance.
+    #[cfg(feature = "whatsapp-web")]
+    fn self_id_disclosure(
+        bot_phone: &Mutex<Option<String>>,
+        bot_lid: &Mutex<Option<String>>,
+    ) -> Option<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for known in [bot_phone.lock().clone(), bot_lid.lock().clone()]
+            .into_iter()
+            .flatten()
+        {
+            let id = Self::jid_digits(&known);
+            if !id.is_empty() && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        (!ids.is_empty()).then(|| format!("[Your id: {}]", ids.join(", ")))
+    }
+
+    /// The turn body the agent sees: what the message says, what it quotes,
+    /// and which ids are the bot's own.
+    #[cfg(feature = "whatsapp-web")]
+    fn with_turn_context(
+        content: String,
+        msg: &waproto::whatsapp::Message,
+        bot_phone: &Mutex<Option<String>>,
+        bot_lid: &Mutex<Option<String>>,
+    ) -> String {
+        let content = Self::with_quoted_reply_prefix(content, msg);
+        match Self::self_id_disclosure(bot_phone, bot_lid) {
+            Some(disclosure) => format!("{disclosure}\n{content}"),
+            None => content,
+        }
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn mime_extension(mime: &str, fallback: &str) -> String {
         let subtype = mime
@@ -904,6 +996,7 @@ impl WhatsAppWebChannel {
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         alias: &str,
         sender: &str,
+        sender_display_name: Option<&str>,
         reply_target: String,
         content: String,
         attachments: Vec<MediaAttachment>,
@@ -916,6 +1009,10 @@ impl WhatsAppWebChannel {
                 channel: "whatsapp".to_string(),
                 channel_alias: Some(alias.to_string()),
                 sender: sender.to_string(),
+                sender_display_name: sender_display_name
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(ToOwned::to_owned),
                 // Reply to the originating chat JID (DM or group), passed
                 // through unchanged (library handles LID addressing internally).
                 reply_target,
@@ -2021,6 +2118,8 @@ impl Channel for WhatsAppWebChannel {
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
                                 let sender = sender_jid.user().to_string();
+                                let sender_push_name = Some(info.push_name.clone())
+                                    .filter(|name| !name.trim().is_empty());
                                 let chat = info.source.chat.to_string();
 
                                 let mapped_phone = if sender_jid.is_lid() {
@@ -2198,8 +2297,14 @@ impl Channel for WhatsAppWebChannel {
                                         &tx_inner,
                                         alias.as_ref(),
                                         &normalized,
+                                        sender_push_name.as_deref(),
                                         reply_target,
-                                        content,
+                                        Self::with_turn_context(
+                                            content,
+                                            msg,
+                                            &bot_phone_inner,
+                                            &bot_lid_inner,
+                                        ),
                                         Vec::new(),
                                         true,
                                         conversation_scope,
@@ -2288,8 +2393,14 @@ impl Channel for WhatsAppWebChannel {
                                     &tx_inner,
                                     alias.as_ref(),
                                     &normalized,
+                                    sender_push_name.as_deref(),
                                     reply_target,
-                                    content,
+                                    Self::with_turn_context(
+                                        content,
+                                        msg,
+                                        &bot_phone_inner,
+                                        &bot_lid_inner,
+                                    ),
                                     attachments,
                                     false,
                                     conversation_scope,
@@ -3536,6 +3647,163 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn quoted_reply_prefix_names_what_the_reply_targets() {
+        // Nothing quoted → nothing prepended.
+        let plain = waproto::whatsapp::Message {
+            conversation: Some("yes".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(WhatsAppWebChannel::quoted_reply_prefix(&plain), None);
+        assert_eq!(
+            WhatsAppWebChannel::with_quoted_reply_prefix("yes".to_string(), &plain),
+            "yes"
+        );
+
+        let quoted = waproto::whatsapp::Message {
+            conversation: Some("should we ship\nthe invoice today?".to_string()),
+            ..Default::default()
+        };
+        let reply = sticker_reply("200@lid", Some(quoted));
+        assert_eq!(
+            WhatsAppWebChannel::with_quoted_reply_prefix("yes".to_string(), &reply),
+            "[Reply to 200: should we ship the invoice today?]\nyes"
+        );
+
+        // Quoted media reuses the media fallback, captions included.
+        let quoted_image = waproto::whatsapp::Message {
+            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                caption: Some("the broken part".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let reply = sticker_reply("200@lid", Some(quoted_image));
+        assert_eq!(
+            WhatsAppWebChannel::quoted_reply_prefix(&reply).as_deref(),
+            Some("[Reply to 200: [Image] the broken part]")
+        );
+
+        // Long quotes are truncated rather than dominating the turn.
+        let quoted_long = waproto::whatsapp::Message {
+            conversation: Some("ש".repeat(500)),
+            ..Default::default()
+        };
+        let reply = sticker_reply("200@lid", Some(quoted_long));
+        let prefix = WhatsAppWebChannel::quoted_reply_prefix(&reply).expect("prefix");
+        assert!(prefix.ends_with("...]"), "{prefix}");
+        assert_eq!(
+            prefix.chars().count(),
+            "[Reply to 200: ]".chars().count()
+                + WhatsAppWebChannel::QUOTED_REPLY_PREFIX_MAX_CHARS
+                + "...".len()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn quoted_reply_prefix_states_the_quoted_author_id() {
+        let quoted = || waproto::whatsapp::Message {
+            conversation: Some("delete sections 2 and 3".to_string()),
+            ..Default::default()
+        };
+
+        // The author id, device suffix stripped. Correlating it with the bot's
+        // own number or a group sender label is the model's job.
+        assert_eq!(
+            WhatsAppWebChannel::quoted_reply_prefix(&sticker_reply(
+                "972532445442:6@s.whatsapp.net",
+                Some(quoted())
+            ))
+            .as_deref(),
+            Some("[Reply to 972532445442: delete sections 2 and 3]")
+        );
+
+        // No usable id → the bare shape.
+        let anonymous = |participant: Option<&str>| waproto::whatsapp::Message {
+            sticker_message: Some(Box::new(waproto::whatsapp::message::StickerMessage {
+                mimetype: Some("image/webp".to_string()),
+                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                    participant: participant.map(ToOwned::to_owned),
+                    quoted_message: Some(Box::new(quoted())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        for participant in [None, Some("@lid")] {
+            assert_eq!(
+                WhatsAppWebChannel::quoted_reply_prefix(&anonymous(participant)).as_deref(),
+                Some("[Reply to: delete sections 2 and 3]")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn self_id_disclosure_states_the_live_session_ids() {
+        let disclosure = |phone: Option<&str>, lid: Option<&str>| {
+            WhatsAppWebChannel::self_id_disclosure(
+                &Mutex::new(phone.map(ToOwned::to_owned)),
+                &Mutex::new(lid.map(ToOwned::to_owned)),
+            )
+        };
+
+        // Both halves of the identity when the session knows both.
+        assert_eq!(
+            disclosure(Some("972533333333"), Some("84342633502")).as_deref(),
+            Some("[Your id: 972533333333, 84342633502]")
+        );
+        // Whichever half resolved first still gets disclosed.
+        assert_eq!(
+            disclosure(Some("972533333333"), None).as_deref(),
+            Some("[Your id: 972533333333]")
+        );
+        assert_eq!(
+            disclosure(None, Some("84342633502@lid")).as_deref(),
+            Some("[Your id: 84342633502]")
+        );
+        // Nothing invented before the session resolves an identity.
+        assert_eq!(disclosure(None, None), None);
+        assert_eq!(disclosure(Some(""), None), None);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn turn_context_discloses_the_bot_ids_above_the_quote() {
+        let quoted = waproto::whatsapp::Message {
+            conversation: Some("delete sections 2 and 3".to_string()),
+            ..Default::default()
+        };
+        let reply = sticker_reply("972532445442@s.whatsapp.net", Some(quoted));
+
+        assert_eq!(
+            WhatsAppWebChannel::with_turn_context(
+                "what am I referencing?".to_string(),
+                &reply,
+                &Mutex::new(Some("972533333333".to_string())),
+                &Mutex::new(Some("84342633502".to_string())),
+            ),
+            "[Your id: 972533333333, 84342633502]\n\
+             [Reply to 972532445442: delete sections 2 and 3]\n\
+             what am I referencing?"
+        );
+
+        // Identity still unknown: the turn carries what it can and no more.
+        assert_eq!(
+            WhatsAppWebChannel::with_turn_context(
+                "what am I referencing?".to_string(),
+                &reply,
+                &Mutex::new(None),
+                &Mutex::new(None),
+            ),
+            "[Reply to 972532445442: delete sections 2 and 3]\n\
+             what am I referencing?"
+        );
     }
 
     #[test]

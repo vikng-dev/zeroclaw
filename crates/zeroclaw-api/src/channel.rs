@@ -228,6 +228,11 @@ pub enum ChannelConversationScope {
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
+    /// Display name the platform reports for `sender` (WhatsApp push name,
+    /// Slack display name, …), when it has one. Presentation only: it is
+    /// sender-controlled, so routing, allowlists and session keys stay on
+    /// `sender`. `None` for channels that expose no such name.
+    pub sender_display_name: Option<String>,
     pub reply_target: String,
     pub content: String,
     pub channel: String,
