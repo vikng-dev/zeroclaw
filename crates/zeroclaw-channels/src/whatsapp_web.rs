@@ -950,6 +950,17 @@ impl WhatsAppWebChannel {
         if let Some(ref document) = base.document_message {
             return Self::captioned_marker("[Document]", document.caption.as_deref());
         }
+        // Reached only when transcription is off or failed — the transcribed
+        // text is spliced in as `[Voice] <text>` before this runs. Without a
+        // marker the content stays empty, the caller returns early, and the
+        // bot answers a voice note with silence.
+        if let Some(ref audio) = base.audio_message {
+            return if audio.ptt == Some(true) {
+                "[Voice]".to_string()
+            } else {
+                "[Audio]".to_string()
+            };
+        }
         if let Some(ref loc) = base.location_message {
             // Live locations are silently ignored — they stream
             // periodic updates and have no meaningful static content.
@@ -2370,11 +2381,14 @@ impl Channel for WhatsAppWebChannel {
                                 }
 
                                 let mut attachments = Vec::new();
+                                // Audio included: a media pipeline (or a
+                                // multimodal model) is the only thing that can
+                                // still use a voice note whose STT failed.
                                 Self::collect_media_attachments(
                                     &client,
                                     msg,
                                     "",
-                                    false,
+                                    true,
                                     &mut attachments,
                                 )
                                 .await;
@@ -4055,6 +4069,39 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
             "[Video]"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_marks_audio_so_a_failed_transcript_still_answers() {
+        let voice = waproto::whatsapp::Message {
+            audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
+                ptt: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &voice),
+            "[Voice]"
+        );
+        // A successful transcript is already in `content` and wins.
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content("[Voice] hello".to_string(), &voice),
+            "[Voice] hello"
+        );
+
+        let audio = waproto::whatsapp::Message {
+            audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
+                ptt: None,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &audio),
+            "[Audio]"
         );
     }
 
