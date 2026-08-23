@@ -865,6 +865,26 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 
 // ── TranscriptionManager ────────────────────────────────────────
 
+/// The bare alias `register_legacy_providers` registers the single provider
+/// configured under `[transcription]` as. Groq is the block's own shape and
+/// therefore the fallback when no sub-table is present.
+#[must_use]
+pub fn single_legacy_provider_alias(config: &TranscriptionConfig) -> &'static str {
+    if config.local_whisper.is_some() {
+        "local_whisper"
+    } else if config.openai.is_some() {
+        "openai"
+    } else if config.deepgram.is_some() {
+        "deepgram"
+    } else if config.assemblyai.is_some() {
+        "assemblyai"
+    } else if config.google.is_some() {
+        "google"
+    } else {
+        "groq"
+    }
+}
+
 /// Manages multiple transcription / STT providers and routes transcription
 /// requests. The manager is implicitly per-agent: the runtime-active
 /// agent's `transcription_provider` reference is the resolved alias for
@@ -1076,6 +1096,22 @@ impl TranscriptionManager {
     pub fn with_agent_transcription_provider(mut self, alias: impl Into<String>) -> Self {
         self.agent_transcription_provider = alias.into();
         self
+    }
+
+    /// Bind the single legacy provider configured under `[transcription]`.
+    ///
+    /// Channels that build their manager from a bare `TranscriptionConfig`
+    /// have no agent to resolve a `transcription_provider` from, so without
+    /// this every `transcribe` call bails on the empty alias.
+    #[must_use]
+    pub fn with_single_legacy_provider(self, config: &TranscriptionConfig) -> Self {
+        self.with_agent_transcription_provider(single_legacy_provider_alias(config))
+    }
+
+    /// The alias `transcribe` dispatches to, empty when unbound.
+    #[must_use]
+    pub fn agent_transcription_provider(&self) -> &str {
+        &self.agent_transcription_provider
     }
 
     /// Transcribe audio using the runtime-active agent's resolved

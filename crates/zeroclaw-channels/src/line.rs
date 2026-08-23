@@ -828,20 +828,7 @@ impl LineChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
-                let m = if config.local_whisper.is_some() {
-                    m.with_agent_transcription_provider("local_whisper")
-                } else if config.openai.is_some() {
-                    m.with_agent_transcription_provider("openai")
-                } else if config.deepgram.is_some() {
-                    m.with_agent_transcription_provider("deepgram")
-                } else if config.assemblyai.is_some() {
-                    m.with_agent_transcription_provider("assemblyai")
-                } else if config.google.is_some() {
-                    m.with_agent_transcription_provider("google")
-                } else {
-                    m.with_agent_transcription_provider("groq")
-                };
-                self.transcription_manager = Some(Arc::new(m));
+                self.transcription_manager = Some(Arc::new(m.with_single_legacy_provider(&config)));
             }
             Err(e) => {
                 ::zeroclaw_log::record!(

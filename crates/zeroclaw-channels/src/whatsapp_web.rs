@@ -195,7 +195,11 @@ impl WhatsAppWebChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
-                self.transcription_manager = Some(std::sync::Arc::new(m));
+                // `new` leaves the dispatch alias empty and this channel has no
+                // agent to resolve one from, so bind the single configured
+                // legacy provider — otherwise every `transcribe` call bails.
+                self.transcription_manager =
+                    Some(std::sync::Arc::new(m.with_single_legacy_provider(&config)));
                 self.transcription = Some(config);
             }
             Err(e) => {
@@ -3365,6 +3369,51 @@ mod tests {
         .with_transcription(tc);
         assert!(ch.transcription.is_none());
         assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_binds_the_configured_provider() {
+        let cases = [
+            (
+                zeroclaw_config::schema::TranscriptionConfig {
+                    enabled: true,
+                    api_key: Some("test_key".to_string()),
+                    ..Default::default()
+                },
+                "groq",
+            ),
+            (
+                zeroclaw_config::schema::TranscriptionConfig {
+                    enabled: true,
+                    openai: Some(zeroclaw_config::schema::OpenAiSttConfig {
+                        api_key: Some("test_key".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "openai",
+            ),
+        ];
+
+        for (tc, expected) in cases {
+            let cfg = zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some("/tmp/test-whatsapp.db".into()),
+                ..Default::default()
+            };
+            let ch = WhatsAppWebChannel::new(
+                &cfg,
+                "whatsapp_web_test_alias",
+                Arc::new(|| vec!["+1234567890".into()]),
+                Arc::new(Vec::new),
+            )
+            .with_transcription(tc);
+
+            // An unbound manager makes `transcribe` bail for every provider.
+            let manager = ch.transcription_manager.expect("manager");
+            assert_eq!(manager.agent_transcription_provider(), expected);
+        }
     }
 
     #[test]
