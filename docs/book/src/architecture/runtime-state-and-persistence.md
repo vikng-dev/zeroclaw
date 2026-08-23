@@ -20,6 +20,9 @@ move it). The current layout is:
 <install>/
 ├── config.toml                 # canonical user config
 ├── .secret_key                 # key for encrypted secrets
+├── auth-profiles.json          # provider OAuth/token profiles (+ .lock)
+├── ms365_token_cache_*.json    # Microsoft 365 bearer-token cache
+├── state/daemon_state.json     # periodic daemon health snapshot
 ├── data/                       # instance-wide runtime data
 │   ├── sessions/
 │   │   ├── sessions.db         # default chat/session backend
@@ -39,6 +42,25 @@ move it). The current layout is:
 The legacy `<install>/workspace/` name is still accepted during migration, but
 new runtime state should be described in terms of `<install>/data/`,
 `<install>/shared/`, and per-agent workspaces.
+
+### Relocating runtime state off the config directory
+
+The three surfaces written directly under `<install>/` — the auth-profile
+store, `state/daemon_state.json`, and the Microsoft 365 token cache — need a
+writable config directory, which a read-only config mount does not provide.
+Set the top-level `state_dir` key (env: `ZEROCLAW_state_dir`) to an absolute
+path and all three move there instead:
+
+```toml
+state_dir = "/z/data"
+```
+
+Omitting the key keeps `<install>/` as the anchor, so existing installs are
+unaffected. New writers of mutable runtime state should resolve their
+directory through `Config::resolved_state_dir()` rather than
+`config_path.parent()`. Note that the auth-profile store's `.secret_key`
+travels with it; the key that encrypts secrets inside `config.toml` stays
+beside `config.toml`.
 
 ## State map
 

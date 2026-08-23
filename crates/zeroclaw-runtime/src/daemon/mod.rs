@@ -736,9 +736,7 @@ pub async fn run(
 
 pub fn state_file_path(config: &Config) -> PathBuf {
     config
-        .config_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .resolved_state_dir()
         .join("state")
         .join("daemon_state.json")
 }
@@ -762,8 +760,23 @@ fn record_daemon_started(config: &Config, host: &str, port: u16) {
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
     zeroclaw_spawn::spawn!(async move {
         let path = state_file_path(&config);
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+        if let Some(parent) = path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            // The periodic writes below discard their errors by design —
+            // health state is best-effort. Say it once here, or an
+            // unwritable state directory (a read-only config mount with no
+            // `state_dir` set) is invisible for the daemon's whole life.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": parent.display().to_string(),
+                        "error": format!("{e}"),
+                    })),
+                "daemon state directory could not be created; health snapshots will not persist"
+            );
         }
 
         let mut interval = tokio::time::interval(Duration::from_secs(STATUS_FLUSH_SECONDS));
@@ -2160,6 +2173,45 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("state").join("daemon_state.json"));
+    }
+
+    #[test]
+    fn state_file_path_follows_configured_state_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.state_dir = Some(tmp.path().join("state-root").to_string_lossy().into_owned());
+
+        let path = state_file_path(&config);
+        assert_eq!(
+            path,
+            tmp.path()
+                .join("state-root")
+                .join("state")
+                .join("daemon_state.json"),
+        );
+    }
+
+    #[tokio::test]
+    async fn state_writer_creates_the_state_subdirectory_under_state_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let state_root = tmp.path().join("state-root");
+        config.state_dir = Some(state_root.to_string_lossy().into_owned());
+
+        let handle = spawn_state_writer(config);
+        let expected = state_root.join("state");
+        for _ in 0..100 {
+            if expected.is_dir() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        handle.abort();
+
+        assert!(
+            expected.is_dir(),
+            "the writer must create state_dir and its `state/` subdirectory",
+        );
     }
 
     #[tokio::test]

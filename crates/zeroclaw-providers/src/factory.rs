@@ -777,12 +777,7 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
             .models_dev_key("xai");
 
         if !has_api_key(key) {
-            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
-                directories::UserDirs::new().map_or_else(
-                    || std::path::PathBuf::from(".zeroclaw"),
-                    |dirs| dirs.home_dir().join(".zeroclaw"),
-                )
-            });
+            let state_dir = opts.auth_state_dir();
             let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
             b = b.auth_profile("xai", auth_service, opts.auth_profile_override.clone());
         }
@@ -1105,12 +1100,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
-            directories::UserDirs::new().map_or_else(
-                || std::path::PathBuf::from(".zeroclaw"),
-                |dirs| dirs.home_dir().join(".zeroclaw"),
-            )
-        });
+        let state_dir = opts.auth_state_dir();
         let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
         Ok(Box::new(
             crate::gemini::GeminiModelProvider::builder(alias)

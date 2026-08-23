@@ -126,6 +126,24 @@ pub struct Config {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
+    /// Directory for mutable runtime state the daemon writes while it runs:
+    /// the auth-profile store (`auth-profiles.json`, its lock file and the
+    /// `.secret_key` that encrypts it), `state/daemon_state.json`, and
+    /// per-integration token caches.
+    ///
+    /// Omitted (the default) means the directory holding `config.toml`,
+    /// which is where every one of those files has always been written.
+    /// Set it to an absolute path when `config.toml` is mounted read-only
+    /// — containers, image-baked configs, config-as-code deployments — so
+    /// the daemon has a writable home that is not the config directory.
+    /// A leading `~/` is expanded.
+    ///
+    /// Moving an existing install also means moving the auth-profile
+    /// store's `.secret_key` alongside `auth-profiles.json`; the key that
+    /// encrypts secrets inside `config.toml` stays with `config.toml`.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+
     /// All configured provider profiles, grouped by category under a
     /// single `[providers]` root. Categories today: `models`, `tts`,
     /// `transcription`. Shape: `[providers.<category>.<type>.<alias>]`,
@@ -4397,6 +4415,24 @@ impl Config {
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+
+    /// Directory for mutable runtime state written while the daemon runs:
+    /// the auth-profile store, `state/daemon_state.json`, and per-integration
+    /// token caches. The single anchor every such writer should resolve
+    /// against, so a read-only config mount needs exactly one key to fix.
+    ///
+    /// Resolves to `state_dir` when set (leading `~/` expanded), otherwise to
+    /// [`Self::install_root_dir`] — the config file's own directory, which is
+    /// where all of it was written before the key existed. Pure; creating the
+    /// directory is each writer's job.
+    #[must_use]
+    pub fn resolved_state_dir(&self) -> std::path::PathBuf {
+        self.state_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map_or_else(|| self.install_root_dir(), expand_tilde_path)
     }
 
     /// Resolve an aliased-agent config by alias. `None` when the alias
@@ -17757,6 +17793,7 @@ impl Default for Config {
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
+            state_dir: None,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -23564,6 +23601,72 @@ max_height = 8
         }
     }
 
+    // ── State dir resolution ──────────────────────────────────
+
+    #[test]
+    async fn resolved_state_dir_defaults_to_the_config_directory() {
+        let cfg = Config {
+            config_path: PathBuf::from("/srv/zeroclaw/config.toml"),
+            state_dir: None,
+            ..Config::default()
+        };
+        assert_eq!(cfg.resolved_state_dir(), PathBuf::from("/srv/zeroclaw"));
+        assert_eq!(cfg.resolved_state_dir(), cfg.install_root_dir());
+    }
+
+    #[test]
+    async fn resolved_state_dir_uses_the_configured_absolute_path() {
+        let cfg = Config {
+            config_path: PathBuf::from("/srv/zeroclaw/config.toml"),
+            state_dir: Some("/z/data".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(cfg.resolved_state_dir(), PathBuf::from("/z/data"));
+    }
+
+    #[test]
+    async fn resolved_state_dir_ignores_a_blank_value() {
+        let cfg = Config {
+            config_path: PathBuf::from("/srv/zeroclaw/config.toml"),
+            state_dir: Some("   ".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(cfg.resolved_state_dir(), PathBuf::from("/srv/zeroclaw"));
+    }
+
+    #[test]
+    async fn resolved_state_dir_expands_leading_tilde() {
+        let cfg = Config {
+            state_dir: Some("~/zeroclaw-state".to_string()),
+            ..Config::default()
+        };
+        let resolved = cfg.resolved_state_dir();
+        if std::env::var("HOME").is_ok() {
+            assert!(!resolved.to_string_lossy().starts_with('~'));
+            assert!(resolved.ends_with("zeroclaw-state"));
+        }
+    }
+
+    #[test]
+    async fn state_dir_is_absent_from_a_default_config_serialization() {
+        let toml = toml::to_string(&Config::default()).expect("serializes");
+        assert!(
+            !toml.contains("state_dir"),
+            "an unset state_dir must not be written back to config.toml: {toml}"
+        );
+    }
+
+    #[test]
+    async fn state_dir_round_trips_through_toml() {
+        let cfg = Config {
+            state_dir: Some("/z/data".to_string()),
+            ..Config::default()
+        };
+        let toml = toml::to_string(&cfg).expect("serializes");
+        let parsed: Config = toml::from_str(&toml).expect("deserializes");
+        assert_eq!(parsed.state_dir.as_deref(), Some("/z/data"));
+    }
+
     /// Build a `Config` whose data dir, install root, and configured plugins dir
     /// live under `root`, and create a plugin at `<parent>/<name>/manifest.toml`.
     fn config_with_dirs(root: &Path) -> Config {
@@ -25475,6 +25578,7 @@ auto_save = true
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
+            state_dir: None,
             providers: {
                 let mut p = crate::providers::Providers::default();
                 p.models.openrouter.insert(
@@ -26461,6 +26565,7 @@ default_temperature = 0.7
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
+            state_dir: None,
             providers,
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),

@@ -1340,11 +1340,11 @@ pub fn all_tools_with_runtime(
                 token_cache_encrypted: ms_cfg.token_cache_encrypted,
                 user_id: ms_cfg.user_id.as_deref().unwrap_or("me").to_string(),
             };
-            // Store token cache in the config directory (next to config.toml),
-            // not the workspace directory, to keep bearer tokens out of the
-            // project tree.
-            let cache_dir = root_config.config_path.parent().unwrap_or(workspace_dir);
-            match Microsoft365Tool::new(resolved, security.clone(), cache_dir) {
+            // Store the token cache in the runtime state directory, not the
+            // workspace directory, to keep bearer tokens out of the project
+            // tree. That is the config directory unless `state_dir` moves it.
+            let cache_dir = root_config.resolved_state_dir();
+            match Microsoft365Tool::new(resolved, security.clone(), &cache_dir) {
                 Ok(tool) => tool_arcs.push(Arc::new(tool)),
                 Err(e) => {
                     ::zeroclaw_log::record!(

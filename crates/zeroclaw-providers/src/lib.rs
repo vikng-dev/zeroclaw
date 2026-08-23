@@ -574,7 +574,13 @@ pub struct ModelProviderRuntimeOptions {
     /// When unset, provider resolution falls back to the configured family.
     pub provider_kind: Option<String>,
     pub provider_api_url: Option<String>,
+    /// Directory holding `config.toml`. Identifies the install; callers that
+    /// need to re-read the config file resolve it from here.
     pub zeroclaw_dir: Option<PathBuf>,
+    /// Directory the auth-profile store reads and writes, from
+    /// `Config::resolved_state_dir()`. `None` falls back to `zeroclaw_dir`,
+    /// which is where the store lived before `state_dir` existed.
+    pub state_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
     pub reasoning_effort: Option<String>,
@@ -627,6 +633,7 @@ impl Default for ModelProviderRuntimeOptions {
             provider_kind: None,
             provider_api_url: None,
             zeroclaw_dir: None,
+            state_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
             reasoning_effort: None,
@@ -645,6 +652,33 @@ impl Default for ModelProviderRuntimeOptions {
             tls_ca_cert_path: None,
         }
     }
+}
+
+impl ModelProviderRuntimeOptions {
+    /// Directory the auth-profile store (`auth-profiles.json`, its lock file
+    /// and the `.secret_key` that encrypts it) lives in. Every provider that
+    /// builds an [`crate::auth::AuthService`] resolves it through here so the
+    /// three-way fallback stays in one place.
+    ///
+    /// `state_dir` wins; `zeroclaw_dir` (the config directory) is the
+    /// pre-`state_dir` location and the default; `~/.zeroclaw` is the
+    /// last resort when neither was supplied.
+    #[must_use]
+    pub fn auth_state_dir(&self) -> PathBuf {
+        self.state_dir
+            .clone()
+            .or_else(|| self.zeroclaw_dir.clone())
+            .unwrap_or_else(default_zeroclaw_dir)
+    }
+}
+
+/// `~/.zeroclaw`, falling back to a relative `.zeroclaw` when the home
+/// directory cannot be determined.
+pub(crate) fn default_zeroclaw_dir() -> PathBuf {
+    directories::UserDirs::new().map_or_else(
+        || PathBuf::from(".zeroclaw"),
+        |dirs| dirs.home_dir().join(".zeroclaw"),
+    )
 }
 
 pub fn model_provider_runtime_options_from_model_provider_entry(
@@ -690,6 +724,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         }),
         provider_api_url: entry.and_then(|e| e.uri.clone()),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
+        state_dir: Some(config.resolved_state_dir()),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
@@ -2735,6 +2770,89 @@ mod tests {
             options.tls_ca_cert_path.as_deref(),
             Some("/tmp/example-ca.pem"),
             "tls_ca_cert_path must propagate from ModelProviderConfig to ModelProviderRuntimeOptions"
+        );
+    }
+
+    #[test]
+    fn auth_state_dir_defaults_to_the_config_directory() {
+        let config = zeroclaw_config::schema::Config {
+            config_path: PathBuf::from("/srv/zeroclaw/config.toml"),
+            ..Default::default()
+        };
+
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, None);
+        assert_eq!(
+            options.auth_state_dir(),
+            PathBuf::from("/srv/zeroclaw"),
+            "without state_dir the auth-profile store stays beside config.toml"
+        );
+    }
+
+    #[test]
+    fn auth_state_dir_follows_the_configured_state_dir() {
+        let config = zeroclaw_config::schema::Config {
+            config_path: PathBuf::from("/srv/zeroclaw/config.toml"),
+            state_dir: Some("/z/data".to_string()),
+            ..Default::default()
+        };
+
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, None);
+        assert_eq!(options.auth_state_dir(), PathBuf::from("/z/data"));
+        assert_eq!(
+            options.zeroclaw_dir,
+            Some(PathBuf::from("/srv/zeroclaw")),
+            "the config directory must stay put — config.toml is not runtime state"
+        );
+    }
+
+    #[test]
+    fn auth_state_dir_falls_back_to_the_config_directory_then_home() {
+        let with_config_dir = ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(PathBuf::from("/srv/zeroclaw")),
+            ..Default::default()
+        };
+        assert_eq!(
+            with_config_dir.auth_state_dir(),
+            PathBuf::from("/srv/zeroclaw")
+        );
+
+        let bare = ModelProviderRuntimeOptions::default();
+        assert_eq!(bare.auth_state_dir(), default_zeroclaw_dir());
+    }
+
+    #[tokio::test]
+    async fn auth_profile_store_writes_under_the_configured_state_dir() {
+        let temp = tempfile::tempdir().expect("temp install");
+        let config_dir = temp.path().join("config");
+        let state_dir = temp.path().join("state-root");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: config_dir.join("config.toml"),
+            state_dir: Some(state_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        config.secrets.encrypt = false;
+
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, None);
+        let auth = crate::auth::AuthService::new(&options.auth_state_dir(), false);
+        auth.store_model_provider_token(
+            "openai",
+            "default",
+            "token-fixture",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .await
+        .expect("store token");
+
+        assert!(
+            state_dir.join("auth-profiles.json").exists(),
+            "auth-profiles.json must land in state_dir"
+        );
+        assert!(
+            !config_dir.join("auth-profiles.json").exists(),
+            "nothing may be written into a read-only config directory"
         );
     }
 

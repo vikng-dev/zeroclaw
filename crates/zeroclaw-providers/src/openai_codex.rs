@@ -15,7 +15,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use zeroclaw_api::tool::ToolSpec;
 
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -125,10 +124,7 @@ impl OpenAiCodexModelProvider {
         options: &ModelProviderRuntimeOptions,
         gateway_api_key: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let state_dir = options
-            .zeroclaw_dir
-            .clone()
-            .unwrap_or_else(default_zeroclaw_dir);
+        let state_dir = options.auth_state_dir();
         let auth = AuthService::new(&state_dir, options.secrets_encrypt);
         let responses_url = resolve_responses_url(options)?;
 
@@ -147,13 +143,6 @@ impl OpenAiCodexModelProvider {
                 .unwrap_or_else(|_| Client::new()),
         })
     }
-}
-
-fn default_zeroclaw_dir() -> PathBuf {
-    directories::UserDirs::new().map_or_else(
-        || PathBuf::from(".zeroclaw"),
-        |dirs| dirs.home_dir().join(".zeroclaw"),
-    )
 }
 
 fn build_responses_url(base_or_endpoint: &str) -> anyhow::Result<String> {
@@ -1977,7 +1966,7 @@ mod tests {
 
     #[test]
     fn default_state_dir_is_non_empty() {
-        let path = default_zeroclaw_dir();
+        let path = ModelProviderRuntimeOptions::default().auth_state_dir();
         assert!(!path.as_os_str().is_empty());
     }
 

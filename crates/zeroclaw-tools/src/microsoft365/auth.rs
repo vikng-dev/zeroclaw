@@ -36,7 +36,7 @@ pub struct TokenCache {
 impl TokenCache {
     pub fn new(
         config: super::types::Microsoft365ResolvedConfig,
-        zeroclaw_dir: &std::path::Path,
+        state_dir: &std::path::Path,
     ) -> anyhow::Result<Self> {
         if config.token_cache_encrypted {
             anyhow::bail!(
@@ -54,7 +54,13 @@ impl TokenCache {
         config.auth_flow.hash(&mut hasher);
         let fingerprint = format!("{:016x}", hasher.finish());
 
-        let cache_path = zeroclaw_dir.join(format!("ms365_token_cache_{fingerprint}.json"));
+        std::fs::create_dir_all(state_dir).with_context(|| {
+            format!(
+                "ms365: failed to create token cache directory {}",
+                state_dir.display()
+            )
+        })?;
+        let cache_path = state_dir.join(format!("ms365_token_cache_{fingerprint}.json"));
         let cached = Self::load_from_disk(&cache_path);
         Ok(Self {
             inner: RwLock::new(cached),
@@ -432,5 +438,39 @@ mod tests {
     fn load_from_disk_returns_none_for_missing_file() {
         let path = std::path::Path::new("/nonexistent/ms365_token_cache.json");
         assert!(TokenCache::load_from_disk(path).is_none());
+    }
+
+    fn test_config() -> super::super::types::Microsoft365ResolvedConfig {
+        super::super::types::Microsoft365ResolvedConfig {
+            tenant_id: "test-tenant".into(),
+            client_id: "test-client".into(),
+            client_secret: Some("secret".into()),
+            auth_flow: "client_credentials".into(),
+            scopes: vec!["https://graph.microsoft.com/.default".into()],
+            token_cache_encrypted: false,
+            user_id: "me".into(),
+        }
+    }
+
+    #[test]
+    fn cache_lands_in_the_given_state_dir_and_creates_it() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state-root");
+
+        let cache = TokenCache::new(test_config(), &state_dir).expect("cache built");
+
+        assert!(state_dir.is_dir(), "the state directory must be created");
+        assert_eq!(cache.cache_path.parent(), Some(state_dir.as_path()));
+        assert!(
+            cache
+                .cache_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(
+                    |name| name.starts_with("ms365_token_cache_") && name.ends_with(".json")
+                ),
+            "unexpected cache file name: {}",
+            cache.cache_path.display()
+        );
     }
 }

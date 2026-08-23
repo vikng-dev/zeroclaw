@@ -304,6 +304,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walker_resolves_top_level_state_dir() {
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set("ZEROCLAW_state_dir", "/z/data");
+
+        let mut config = Config {
+            config_path: std::path::PathBuf::from("/srv/zeroclaw/config.toml"),
+            ..Config::default()
+        };
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(applied.paths.contains("state_dir"));
+        assert_eq!(config.state_dir.as_deref(), Some("/z/data"));
+        assert_eq!(
+            config.resolved_state_dir(),
+            std::path::PathBuf::from("/z/data"),
+        );
+    }
+
+    #[tokio::test]
     async fn walker_rejects_unknown_path() {
         let _guard = super::env_test_lock().await;
         let _v = EnvVarGuard::set("ZEROCLAW_no__such__field", "x");

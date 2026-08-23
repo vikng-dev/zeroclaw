@@ -820,6 +820,7 @@ mod tests {
             "file_upload_bundle",
             "file_download",
             "wss",
+            "state_dir",
         ];
 
         let violations: Vec<&String> = roots

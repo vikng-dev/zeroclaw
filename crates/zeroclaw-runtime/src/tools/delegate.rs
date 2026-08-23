@@ -645,6 +645,9 @@ impl DelegateTool {
             if options.zeroclaw_dir.is_none() {
                 options.zeroclaw_dir = self.provider_runtime_options.zeroclaw_dir.clone();
             }
+            if options.state_dir.is_none() {
+                options.state_dir = self.provider_runtime_options.state_dir.clone();
+            }
             return zeroclaw_providers::create_model_provider_for_alias(
                 config, family, alias, credential, &options,
             );
