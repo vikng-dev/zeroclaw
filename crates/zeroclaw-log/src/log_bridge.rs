@@ -46,29 +46,32 @@
 //!
 //! # The safe target representation
 //!
-//! A target crosses **verbatim** only if it is non-empty, at most
-//! [`MAX_TARGET_LEN`] bytes, and made entirely of ASCII alphanumerics, `_`,
-//! `:` and `/`. Anything else is replaced *whole* by the constant
-//! [`REDACTED_TARGET`] — never truncated and never rewritten character by
-//! character, because a partial target leaks the fragments it kept.
+//! The target that crosses is drawn from a reviewed, finite vocabulary —
+//! never from the record. Two constant tables, both read off the locked
+//! dependency sources, are that whole vocabulary:
 //!
-//! That charset is the union of the two target shapes this workspace's
-//! dependency tree actually produces: Rust module paths (`whatsapp_rust`,
-//! `whatsapp_rust::socket`), which are the default target of every `log!`
-//! call without a `target:` argument, and the slash-separated component
-//! targets the pinned `whatsapp-rust` revision writes by hand
-//! (`Client/PairCode`, `Client/UnifiedSession` — 21 bytes at its longest).
+//! - [`TARGET_LITERALS`]: the hand-written `target: "..."` literals in the
+//!   pinned `whatsapp-rust` revision (38 at `cbcdd2a6`, `AppState` through
+//!   `usync`; the pin contains no computed target expression). An incoming
+//!   target crosses only on an exact match, and what crosses is the table's
+//!   own constant.
+//! - [`TARGET_CRATES`]: the crates in the pinned tree that log through the
+//!   facade *without* an explicit `target:`, so their records arrive with
+//!   the module path as the target. Only the crate's reviewed name crosses:
+//!   everything after `::` in a module path is still a runtime string that a
+//!   hand-built record can abuse (`whatsapp_rust::<jid>` is charset-clean),
+//!   so `whatsapp_rust::socket` is reduced to `whatsapp_rust`.
 //!
-//! State the limit of this plainly: the charset bounds the target's *shape*,
-//! not its meaning. An identifier-shaped word is an identifier-shaped word,
-//! so a dependency that put `Alice` in a runtime target would still see
-//! `Alice` cross. What the rule guarantees is that the surviving field is a
-//! short, bounded, identifier-shaped token rather than an arbitrary string:
-//! no whitespace, no punctuation, no `@`, no non-ASCII, nothing over
-//! [`MAX_TARGET_LEN`] bytes, and so no room for a formatted sentence, a
-//! phone number, a JID, a path or a credential. The three genuinely unbounded
-//! channels are gone entirely; this one is kept, bounded, because the
-//! filtering contract needs it.
+//! Anything else is replaced *whole* by [`REDACTED_TARGET`] — never
+//! truncated and never rewritten character by character, because a partial
+//! target leaks the fragments it kept. Fitness is provenance against the
+//! tables, not shape: a phone-shaped, secret-shaped or name-shaped runtime
+//! value cannot cross no matter which characters it is made of, because the
+//! emitted target is by construction one of this file's constants. The
+//! price is granularity, not filterability: `RUST_LOG=whatsapp_rust=debug`
+//! still addresses every record of the crate, while a per-module directive
+//! (`whatsapp_rust::socket=debug`) no longer matches anything, since the
+//! reduction happens before the filters look.
 //!
 //! Note the deliberate contrast with [`zeroclaw_memory::redact`], which is
 //! allow-by-default: it rewrites *recognized* patterns in user content the
@@ -93,38 +96,76 @@ pub(crate) const REDACTED_MESSAGE: &str = "[third-party message redacted]";
 ///
 /// Whole-target replacement, for the same reason the message body is replaced
 /// whole: a truncated or character-scrubbed target would still carry the
-/// fragments it kept. Its own shape is deliberately outside the safe charset,
-/// so it cannot be mistaken for a target a dependency chose and so
-/// [`safe_target`] is idempotent over it.
+/// fragments it kept. It appears in neither reviewed table, so it cannot be
+/// mistaken for a target a dependency chose and [`safe_target`] is idempotent
+/// over it.
 pub(crate) const REDACTED_TARGET: &str = "[third-party target redacted]";
 
-/// Byte ceiling for a target that crosses verbatim. Generous next to the
-/// real ones — the longest target in the pinned `whatsapp-rust` revision is
-/// 21 bytes — and small enough that nothing sentence-shaped fits.
-pub(crate) const MAX_TARGET_LEN: usize = 128;
+/// The hand-written `target: "..."` literals in the pinned `whatsapp-rust`
+/// revision (`cbcdd2a6`), read off its sources whole — the pin has no
+/// computed target expression. Byte-sorted for the binary search; a test
+/// pins the ordering. An entry here is a claim that this exact string was
+/// seen in the reviewed dependency source, so the table only grows by
+/// re-reading a pin.
+pub(crate) const TARGET_LITERALS: &[&str] = &[
+    "AppState",
+    "Blocking",
+    "Bot/PairCode",
+    "Chatstate",
+    "ChatstateHandler",
+    "Client/AccountSync",
+    "Client/Ack",
+    "Client/AppState",
+    "Client/Business",
+    "Client/Contacts",
+    "Client/CsToken",
+    "Client/DeviceProps",
+    "Client/DeviceRegistry",
+    "Client/Foo",
+    "Client/Group",
+    "Client/Groups",
+    "Client/IQ",
+    "Client/Keepalive",
+    "Client/Mex",
+    "Client/OfflineResume",
+    "Client/OfflineSync",
+    "Client/PDO",
+    "Client/PairCode",
+    "Client/PairTest",
+    "Client/Picture",
+    "Client/Receipt",
+    "Client/Recv",
+    "Client/Send",
+    "Client/Status",
+    "Client/TcToken",
+    "Client/UnifiedSession",
+    "MessageQueue",
+    "Mex",
+    "PresenceHandler",
+    "TcToken",
+    "UnifiedSession",
+    "blocklist",
+    "usync",
+];
 
-/// True for the bytes a verbatim target may contain: ASCII alphanumerics,
-/// `_` and `:` for Rust module paths, `/` for the pinned dependency's
-/// hand-written component targets.
-fn is_safe_target_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'/')
-}
+/// The crates in the pinned tree that log through the facade without an
+/// explicit `target:`, so their records carry the module path as the
+/// target. A module-path target is reduced to its crate's reviewed name;
+/// the segments after `::` are runtime strings and never cross.
+pub(crate) const TARGET_CRATES: &[&str] = &["wacore", "whatsapp_rust"];
 
-/// The target as it is allowed to cross: the dependency's own value when it
-/// is in the safe representation, [`REDACTED_TARGET`] otherwise.
-///
-/// Borrowing rather than allocating keeps this on the hot path of every
-/// dependency record, including the ones the filters are about to discard.
-fn safe_target(target: &str) -> &str {
-    let bytes = target.as_bytes();
-    if !bytes.is_empty()
-        && bytes.len() <= MAX_TARGET_LEN
-        && bytes.iter().all(|byte| is_safe_target_byte(*byte))
-    {
-        target
-    } else {
-        REDACTED_TARGET
+/// The target as it is allowed to cross: a constant from the reviewed
+/// tables, or [`REDACTED_TARGET`]. Never a borrow of the record's own
+/// value, so the emitted vocabulary is closed by construction.
+fn safe_target(target: &str) -> &'static str {
+    if let Ok(found) = TARGET_LITERALS.binary_search(&target) {
+        return TARGET_LITERALS[found];
     }
+    let root = target.split("::").next().unwrap_or(target);
+    if let Ok(found) = TARGET_CRATES.binary_search(&root) {
+        return TARGET_CRATES[found];
+    }
+    REDACTED_TARGET
 }
 
 /// The `log` logger installed in the process-global slot. Forwards each
@@ -251,51 +292,71 @@ pub(crate) fn install_best_effort_for_tests() {
 mod tests {
     use super::*;
 
-    /// The shapes the pinned dependency tree actually emits must cross
-    /// untouched, or the bridge stops being addressable by `RUST_LOG` and
-    /// stops naming which dependency spoke.
+    /// Both tables must be byte-sorted or the binary searches silently miss
+    /// entries — a miss here fails closed (redaction), but it would still be
+    /// a reviewed name going dark.
     #[test]
-    fn real_dependency_targets_cross_verbatim() {
-        for target in [
-            "whatsapp_rust",
-            "whatsapp_rust::socket",
-            "Client/PairCode",
-            "Client/UnifiedSession",
-            "usync",
-            "h2",
-        ] {
-            assert_eq!(
-                safe_target(target),
-                target,
-                "a target the dependency tree really uses must cross verbatim"
+    fn the_reviewed_tables_are_sorted_for_the_binary_search() {
+        for table in [TARGET_LITERALS, TARGET_CRATES] {
+            assert!(
+                table.windows(2).all(|pair| pair[0] < pair[1]),
+                "a reviewed table must be strictly byte-sorted: {table:?}"
             );
         }
     }
 
-    /// Everything outside the documented representation is replaced whole:
-    /// no truncation, no character scrubbing, so no fragment survives.
+    /// The targets the pinned dependency actually emits must cross as their
+    /// reviewed constants, or the bridge stops being addressable by
+    /// `RUST_LOG` and stops naming which dependency spoke.
     #[test]
-    fn targets_outside_the_safe_representation_are_replaced_whole() {
-        let over_long = "a".repeat(MAX_TARGET_LEN + 1);
+    fn reviewed_dependency_targets_cross_as_their_constants() {
+        for target in [
+            "AppState",
+            "Client/PairCode",
+            "Client/UnifiedSession",
+            "usync",
+        ] {
+            assert_eq!(
+                safe_target(target),
+                target,
+                "a hand-written literal from the pinned source must cross"
+            );
+        }
+        // Module-path targets reduce to the crate's reviewed name: the crate
+        // is provable, the path after `::` is a runtime string.
+        assert_eq!(safe_target("whatsapp_rust"), "whatsapp_rust");
+        assert_eq!(safe_target("whatsapp_rust::socket"), "whatsapp_rust");
+        assert_eq!(safe_target("wacore::send"), "wacore");
+        // Which is also what defuses a payload smuggled behind a real crate
+        // name — charset-clean, and it still cannot cross.
+        assert_eq!(safe_target("whatsapp_rust::9725012345678"), "whatsapp_rust");
+    }
+
+    /// Everything outside the reviewed tables is replaced whole — no
+    /// truncation, no character scrubbing — and shape does not help:
+    /// every value here fits the old charset rule and each one is exactly
+    /// the kind of runtime payload the tables exist to stop.
+    #[test]
+    fn payload_shaped_targets_are_replaced_whole_whatever_their_shape() {
+        let over_long = "a".repeat(4096);
         for target in [
             "",
+            "9725012345678",              // bare numeric, phone-shaped
+            "sk_live_4eC39HqLyjWDarjtT1", // underscore-separated, secret-shaped
+            "Alice",                      // identifier-shaped name
+            "Client/Foo2",                // near-miss of a reviewed literal
             "has space",
             "972501234567@s.whatsapp.net",
             "/etc/passwd\n",
             "Zoë Müller",
-            "target=Alice",
-            "quoted\"target",
             over_long.as_str(),
         ] {
             assert_eq!(
                 safe_target(target),
                 REDACTED_TARGET,
-                "a target outside the safe representation must be replaced whole: {target:?}"
+                "a target outside the reviewed tables must be replaced whole: {target:?}"
             );
         }
-        // The boundary itself, so the cap is a cap and not an off-by-one.
-        let at_limit = "a".repeat(MAX_TARGET_LEN);
-        assert_eq!(safe_target(&at_limit), at_limit);
     }
 
     /// The replacement is itself outside the representation, so re-running
