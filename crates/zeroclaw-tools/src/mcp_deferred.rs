@@ -238,9 +238,10 @@ impl Default for ActivatedToolSet {
 // ── System prompt helper ─────────────────────────────────────────────────
 
 /// Build the `<available-deferred-tools>` section for the system prompt.
-/// Lists only tool names so the LLM knows what is available without
-/// consuming context window on full schemas. Includes an instruction
-/// block that tells the LLM to call `tool_search` to activate them.
+/// Lists each tool's name with the first sentence of its description, so
+/// the LLM knows what is available without consuming context window on
+/// full schemas or full descriptions. Includes an instruction block that
+/// tells the LLM to call `tool_search` to activate them.
 pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
     build_deferred_tools_section_filtered(deferred, None)
 }
@@ -282,7 +283,7 @@ pub fn build_deferred_tools_section_excluding(
         }
         out.push_str(&stub.prefixed_name);
         out.push_str(" - ");
-        out.push_str(&stub.description);
+        out.push_str(first_sentence(&stub.description));
         out.push('\n');
         count += 1;
     }
@@ -291,6 +292,24 @@ pub fn build_deferred_tools_section_excluding(
         return String::new();
     }
     out
+}
+
+/// The listing form of a description: the first sentence of the first line.
+/// The listing is an index, not a manual — activating a tool through
+/// `tool_search` returns its full description and schema, so each entry only
+/// needs enough text to be found by. An abbreviation mid-sentence ("e.g. ")
+/// cuts early; that trade is fine for text one `tool_search` call away.
+fn first_sentence(desc: &str) -> &str {
+    let line = desc.trim().lines().next().unwrap_or("").trim_end();
+    for (i, c) in line.char_indices() {
+        if matches!(c, '.' | '!' | '?') {
+            let end = i + c.len_utf8();
+            if line[end..].chars().next().is_none_or(char::is_whitespace) {
+                return &line[..end];
+            }
+        }
+    }
+    line
 }
 
 #[cfg(test)]
@@ -579,6 +598,50 @@ mod tests {
         };
         let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
         assert!(build_deferred_tools_section_excluding(&set, None, &exclude).is_empty());
+    }
+
+    #[test]
+    fn first_sentence_cuts_at_the_first_boundary() {
+        assert_eq!(
+            first_sentence(
+                "Deletes an access control rule from a Google Calendar. Use when \
+                 you need to remove sharing permissions.\nSecond line."
+            ),
+            "Deletes an access control rule from a Google Calendar."
+        );
+    }
+
+    #[test]
+    fn first_sentence_without_a_period_is_verbatim() {
+        assert_eq!(first_sentence("Read a file"), "Read a file");
+    }
+
+    #[test]
+    fn first_sentence_does_not_cut_inside_a_version_number() {
+        assert_eq!(
+            first_sentence("Runs v1.2 of the sync. Second sentence."),
+            "Runs v1.2 of the sync."
+        );
+    }
+
+    #[test]
+    fn build_deferred_section_lists_first_sentences_only() {
+        let stubs = vec![make_stub(
+            "fs__read_file",
+            "Read a file. Streams the bytes slowly on purpose.",
+        )];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+        };
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("fs__read_file - Read a file.\n"));
+        assert!(!section.contains("Streams the bytes"));
     }
 
     #[test]
