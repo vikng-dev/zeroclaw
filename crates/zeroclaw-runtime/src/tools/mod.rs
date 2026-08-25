@@ -99,6 +99,7 @@ pub use zeroclaw_tools::poll::PollTool;
 pub use zeroclaw_tools::project_intel::ProjectIntelTool;
 pub use zeroclaw_tools::proxy_config::ProxyConfigTool;
 pub use zeroclaw_tools::pushover::PushoverTool;
+pub use zeroclaw_tools::fetch_media::FetchMediaTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
@@ -1250,6 +1251,19 @@ pub fn all_tools_with_runtime(
     // plus a raw catch-all over the channel's single forge_request transport.
     let git_forge_tool = GitForgeTool::new(security.clone(), Arc::clone(&reaction_handle));
     tool_arcs.push(Arc::new(git_forge_tool));
+
+    // Media claim-ticket redemption: reads [WA-MEDIA:...] descriptors out of
+    // the current chat's persisted history and asks the owning channel (via
+    // the same late-bound map) to download and render them.
+    if let Ok(backend) =
+        zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
+    {
+        tool_arcs.push(Arc::new(FetchMediaTool::new(
+            security.clone(),
+            Arc::clone(&reaction_handle),
+            backend,
+        )));
+    }
 
     // Channel room-management tool — always registered; owns its own late-bound channel map.
     let channel_room_handle: Option<PerToolChannelHandle> =

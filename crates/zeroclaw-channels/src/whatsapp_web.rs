@@ -1031,6 +1031,51 @@ impl WhatsAppWebChannel {
         String::new()
     }
 
+    /// Build a media claim ticket for a message whose media the passive lane
+    /// deliberately does not download: a base64 JSON descriptor carrying
+    /// exactly what `Client::download_from_params` needs to redeem it later.
+    /// Audio and image only — the kinds the redeem path can render.
+    #[cfg(feature = "whatsapp-web")]
+    fn media_ref_descriptor(msg: &waproto::whatsapp::Message) -> Option<String> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use wacore::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+        let (kind, mime, dp, mk, es, fs, len) = if let Some(ref a) = base.audio_message {
+            (
+                "audio",
+                a.mimetype.clone(),
+                a.direct_path.clone(),
+                a.media_key.clone(),
+                a.file_enc_sha256.clone(),
+                a.file_sha256.clone(),
+                a.file_length,
+            )
+        } else if let Some(ref i) = base.image_message {
+            (
+                "image",
+                i.mimetype.clone(),
+                i.direct_path.clone(),
+                i.media_key.clone(),
+                i.file_enc_sha256.clone(),
+                i.file_sha256.clone(),
+                i.file_length,
+            )
+        } else {
+            return None;
+        };
+        let doc = serde_json::json!({
+            "v": 1,
+            "k": kind,
+            "dp": dp?,
+            "mk": STANDARD.encode(mk?),
+            "es": STANDARD.encode(es?),
+            "fs": fs.map(|b| STANDARD.encode(b)),
+            "len": len.unwrap_or(0),
+            "mime": mime,
+        });
+        Some(STANDARD.encode(doc.to_string()))
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn group_context_scope(
         passive_group_context: bool,
@@ -1786,6 +1831,74 @@ impl Channel for WhatsAppWebChannel {
         "whatsapp"
     }
 
+    async fn fetch_media(&self, descriptor: &str) -> Result<String> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected");
+        };
+        let raw = STANDARD
+            .decode(descriptor.trim())
+            .map_err(|_| anyhow::anyhow!("malformed media descriptor"))?;
+        let doc: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|_| anyhow::anyhow!("malformed media descriptor"))?;
+        let field = |name: &str| {
+            doc.get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let kind = field("k").unwrap_or_default();
+        let media_type = match kind.as_str() {
+            "audio" => wacore::download::MediaType::Audio,
+            "image" => wacore::download::MediaType::Image,
+            other => anyhow::bail!("unsupported media kind '{other}' in descriptor"),
+        };
+        let dp = field("dp").ok_or_else(|| anyhow::anyhow!("descriptor missing direct path"))?;
+        let mk = STANDARD
+            .decode(field("mk").unwrap_or_default())
+            .map_err(|_| anyhow::anyhow!("descriptor missing media key"))?;
+        let es = STANDARD
+            .decode(field("es").unwrap_or_default())
+            .map_err(|_| anyhow::anyhow!("descriptor missing file hash"))?;
+        let fs = field("fs")
+            .and_then(|v| STANDARD.decode(v).ok())
+            .unwrap_or_default();
+        let len = doc.get("len").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let mime = field("mime");
+
+        let data = client
+            .download_from_params(&dp, &mk, &fs, &es, len, media_type)
+            .await
+            .map_err(|e| anyhow::anyhow!("media download failed: {e}"))?;
+
+        if kind == "audio" {
+            let Some(manager) = self.transcription_manager.as_deref() else {
+                anyhow::bail!("transcription is not configured on this instance");
+            };
+            let file_name = match mime.as_deref() {
+                Some(m) if m.contains("mp4") || m.contains("m4a") => "voice.m4a",
+                Some(m) if m.contains("mpeg") || m.contains("mp3") => "voice.mp3",
+                Some(m) if m.contains("webm") => "voice.webm",
+                _ => "voice.ogg",
+            };
+            let text = manager
+                .transcribe(&data, file_name)
+                .await
+                .map_err(|e| anyhow::anyhow!("transcription failed: {e}"))?;
+            Ok(format!("[Audio transcription: {}]", text.trim()))
+        } else {
+            const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+            if data.len() > MAX_IMAGE_BYTES {
+                anyhow::bail!("image too large to inline ({} bytes)", data.len());
+            }
+            let mime = mime.unwrap_or_else(|| "image/jpeg".to_string());
+            Ok(format!(
+                "[IMAGE:data:{mime};base64,{}]",
+                STANDARD.encode(&data)
+            ))
+        }
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {
@@ -2380,6 +2493,15 @@ impl Channel for WhatsAppWebChannel {
                                     if content.is_empty() {
                                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring empty passive group context from {}", normalized));
                                         return;
+                                    }
+                                    // Media stays undownloaded on this lane;
+                                    // the claim ticket lets a later
+                                    // fetch_media call redeem it.
+                                    if let Some(desc) = Self::media_ref_descriptor(msg) {
+                                        content = format!(
+                                            "{content}\n{}{desc}]",
+                                            zeroclaw_api::media_ref::MEDIA_REF_PREFIX
+                                        );
                                     }
                                     Self::send_inbound_channel_message(
                                         &tx_inner,

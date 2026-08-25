@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std", "rc"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

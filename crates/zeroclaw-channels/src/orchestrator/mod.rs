@@ -1208,6 +1208,26 @@ fn collapse_inline_image_payloads(turns: &mut [ChatMessage]) {
     }
 }
 
+/// Compact media claim tickets in cached turns: the persisted row keeps the
+/// full `[WA-MEDIA:...]` descriptor, while the prompt shows a short reference
+/// the fetch_media tool redeems by id. A payload that does not parse as a
+/// descriptor is left untouched.
+fn collapse_media_ref_markers(turns: &mut [ChatMessage]) {
+    for turn in turns.iter_mut() {
+        if !turn.content.contains(zeroclaw_api::media_ref::MEDIA_REF_PREFIX) {
+            continue;
+        }
+        turn.content = zeroclaw_api::media_ref::replace_media_refs(&turn.content, |payload| {
+            zeroclaw_api::media_ref::summarize_media_ref(payload).map(|s| {
+                format!(
+                    "[undownloaded {} — id {} — the fetch_media tool can retrieve it]",
+                    s.kind, s.id
+                )
+            })
+        });
+    }
+}
+
 fn strip_inline_data_image_markers(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut cursor = 0usize;
@@ -5044,6 +5064,7 @@ async fn process_channel_message_body(
     // re-inflate from disk inline base64 is dropped to keep history
     // within the context budget
     collapse_inline_image_payloads(&mut prior_turns);
+    collapse_media_ref_markers(&mut prior_turns);
 
     let is_group_chat = is_group_reply_target(&msg.reply_target);
     let mut memory_sessions: Vec<Option<String>> = sender_memory_session_ids(&msg, &history_key)
@@ -13308,6 +13329,22 @@ api_key = "anthropic-key"
             strip_tool_summary_prefix("[Background work] Trashed 52 messages.\nDone."),
             "Trashed 52 messages.\nDone."
         );
+    }
+
+    #[test]
+    fn collapse_media_ref_markers_compacts_tickets_and_skips_lookalikes() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let payload = STANDARD.encode(r#"{"v":1,"k":"audio","es":"AbCdEfGhIj","dp":"/x"}"#);
+        let mut turns = vec![
+            ChatMessage::user(&format!("[Voice]\n[WA-MEDIA:{payload}]")),
+            ChatMessage::user("typed [WA-MEDIA:not-a-ticket] stays"),
+        ];
+        collapse_media_ref_markers(&mut turns);
+        assert_eq!(
+            turns[0].content,
+            "[Voice]\n[undownloaded audio — id AbCdEfGh — the fetch_media tool can retrieve it]"
+        );
+        assert_eq!(turns[1].content, "typed [WA-MEDIA:not-a-ticket] stays");
     }
 
     #[test]

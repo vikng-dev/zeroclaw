@@ -8,6 +8,7 @@ pub mod hook;
 pub mod ingress;
 pub mod jsonrpc;
 pub mod media;
+pub mod media_ref;
 pub mod memory_traits;
 pub mod model_provider;
 pub mod observability_traits;

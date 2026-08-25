@@ -13207,6 +13207,7 @@ version = "0.8.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "futures-util",
  "parking_lot",
  "serde",

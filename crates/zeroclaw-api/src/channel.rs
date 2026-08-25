@@ -701,6 +701,14 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Redeem an inline media claim ticket (see `crate::media_ref`): download
+    /// the referenced media and return agent-readable text — a transcription,
+    /// an inline image marker, or a note. Channels that never mint
+    /// descriptors keep the default refusal.
+    async fn fetch_media(&self, _descriptor: &str) -> anyhow::Result<String> {
+        anyhow::bail!("this channel cannot retrieve referenced media")
+    }
+
     /// Add a reaction (emoji) to a message.
     async fn add_reaction(
         &self,
