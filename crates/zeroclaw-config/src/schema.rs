@@ -3387,6 +3387,7 @@ pub struct ResolvedRuntime {
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
+    pub tool_context_mode: ToolContextMode,
     pub tool_receipts: ToolReceiptsConfig,
     pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
@@ -3426,6 +3427,7 @@ impl Default for ResolvedRuntime {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            tool_context_mode: ToolContextMode::default(),
             tool_receipts: ToolReceiptsConfig::default(),
             prompt_injection_mode: SkillsPromptInjectionMode::default(),
         }
@@ -4128,6 +4130,13 @@ impl Config {
             .unwrap_or_else(default_keep_tool_context_turns)
     }
 
+    #[must_use]
+    pub fn effective_tool_context_mode(&self, agent_alias: &str) -> ToolContextMode {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.tool_context_mode)
+            .unwrap_or_default()
+    }
+
     /// Return a clone of the named agent's `AliasedAgentConfig` with all
     /// runtime-profile overrides baked in. Use this when an `Agent` (or
     /// any other struct) needs to own a self-contained, already-resolved
@@ -4158,6 +4167,7 @@ impl Config {
             max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
             max_tool_result_chars: self.effective_max_tool_result_chars(agent_alias),
             keep_tool_context_turns: self.effective_keep_tool_context_turns(agent_alias),
+            tool_context_mode: self.effective_tool_context_mode(agent_alias),
             prompt_injection_mode: self.effective_skills_prompt_mode(agent_alias),
             ..ResolvedRuntime::default()
         };
@@ -5914,6 +5924,26 @@ fn default_max_tool_result_chars() -> usize {
 
 fn default_keep_tool_context_turns() -> usize {
     2
+}
+
+/// How a completed turn's tool traffic is persisted into channel history.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolContextMode {
+    /// Persist the raw tool-call/result messages (gated by
+    /// `keep_tool_context_turns`). One tool-heavy turn can evict hours of
+    /// conversation from the bounded history window.
+    #[default]
+    Raw,
+    /// Collapse the turn's tool traffic into one deterministic note naming
+    /// the tools used, so history keeps the conversational spine.
+    Digest,
+    /// Collapse it into a model-written one-paragraph recall note; falls
+    /// back to the deterministic digest when the model call fails.
+    Summary,
 }
 
 fn default_agent_tool_dispatcher() -> String {
@@ -11994,6 +12024,13 @@ pub struct RuntimeProfileConfig {
     pub max_tool_result_chars: Option<usize>,
     /// Number of recent turns whose full tool context is preserved. `None` inherits.
     pub keep_tool_context_turns: Option<usize>,
+    /// How a completed turn's tool traffic enters channel history: `raw`
+    /// keeps the full call/result messages (gated by
+    /// `keep_tool_context_turns`), `digest` collapses them into one
+    /// deterministic note, `summary` into a model-written recall paragraph
+    /// (digest on failure). `None` inherits (`raw`).
+    #[serde(default)]
+    pub tool_context_mode: Option<ToolContextMode>,
     /// Maximum memory entries injected per turn. `None` inherits global default (5).
     /// Set to `0` for unlimited.
     pub memory_recall_limit: Option<usize>,
@@ -12041,6 +12078,7 @@ impl Default for RuntimeProfileConfig {
             max_system_prompt_chars: None,
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
+            tool_context_mode: None,
             memory_recall_limit: None,
             prompt_injection_mode: None,
             strict_tool_parsing: false,

@@ -1290,15 +1290,19 @@ fn strip_tool_result_content(text: &str) -> String {
 }
 
 fn strip_tool_summary_prefix(text: &str) -> String {
-    if let Some(rest) = text.strip_prefix("[Used tools:") {
-        // Find the closing bracket, then skip it and any leading newline(s).
-        if let Some(bracket_end) = rest.find(']') {
-            let after_bracket = &rest[bracket_end + 1..];
-            let trimmed = after_bracket.trim_start_matches('\n');
-            if trimmed.is_empty() {
-                return String::new();
+    // "[Used tools: ...]" and "[Background work...]" are internal history
+    // markers; a model may echo either at the head of a reply.
+    for marker in ["[Used tools:", BACKGROUND_WORK_PREFIX] {
+        if let Some(rest) = text.strip_prefix(marker) {
+            // Find the closing bracket, then skip it and any leading newline(s).
+            if let Some(bracket_end) = rest.find(']') {
+                let after_bracket = &rest[bracket_end + 1..];
+                let trimmed = after_bracket.trim_start();
+                if trimmed.is_empty() {
+                    return String::new();
+                }
+                return trimmed.to_string();
             }
-            return trimmed.to_string();
         }
     }
     text.to_string()
@@ -2160,6 +2164,160 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
         .filter(|m| m.role == "assistant" || m.role == "tool")
         .cloned()
         .collect()
+}
+
+/// The marker opening every collapsed background-work note. History keeps
+/// the note — recall is its point — while the delivery guardrail strips any
+/// echo of it from outbound text.
+const BACKGROUND_WORK_PREFIX: &str = "[Background work";
+
+/// One deterministic line naming this turn's tool activity, e.g.
+/// `[Background work: 14 tool calls — google__GMAIL_SEARCH x3, shell]`.
+/// Returns `None` for a turn with no tool traffic.
+fn background_work_digest(tool_messages: &[ChatMessage]) -> Option<String> {
+    if tool_messages.is_empty() {
+        return None;
+    }
+
+    fn bump(names: &mut Vec<(String, usize)>, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(entry) = names.iter_mut().find(|(n, _)| n == name) {
+            entry.1 += 1;
+        } else {
+            names.push((name.to_string(), 1));
+        }
+    }
+
+    // Tool names live in the assistant tool-call messages: native JSON
+    // (`{"tool_calls":[{"function":{"name":..}} | {"name":..}]}`) or
+    // prompt-mode `<tool_call>{"name":..}</tool_call>` tags.
+    let mut names: Vec<(String, usize)> = Vec::new();
+    for msg in tool_messages {
+        if msg.role != "assistant" {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg.content)
+            && let Some(calls) = val.get("tool_calls").and_then(|c| c.as_array())
+        {
+            for call in calls {
+                let name = call
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .or_else(|| call.get("name").and_then(|n| n.as_str()));
+                if let Some(name) = name {
+                    bump(&mut names, name);
+                }
+            }
+            continue;
+        }
+        for segment in msg.content.split("<tool_call>") {
+            if let Some(end) = segment.find("</tool_call>")
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(segment[..end].trim())
+                && let Some(name) = val.get("name").and_then(|n| n.as_str())
+            {
+                bump(&mut names, name);
+            }
+        }
+    }
+
+    let call_count = tool_messages.iter().filter(|m| m.role == "tool").count();
+    let call_count = call_count.max(names.iter().map(|(_, c)| c).sum());
+    let plural = if call_count == 1 { "" } else { "s" };
+    if names.is_empty() {
+        return Some(format!(
+            "{BACKGROUND_WORK_PREFIX}: {call_count} tool call{plural}]"
+        ));
+    }
+    let listed = names
+        .iter()
+        .map(|(n, c)| {
+            if *c > 1 {
+                format!("{n} x{c}")
+            } else {
+                n.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "{BACKGROUND_WORK_PREFIX}: {call_count} tool call{plural} — {listed}]"
+    ))
+}
+
+/// Cap the serialized tool traffic handed to the summary model: keep the
+/// head and tail, which hold the intent and the outcome.
+fn clip_for_summary(raw: &str, max_chars: usize) -> String {
+    if raw.len() <= max_chars {
+        return raw.to_string();
+    }
+    let half = max_chars / 2;
+    let head_end = raw
+        .char_indices()
+        .take_while(|(i, _)| *i <= half)
+        .last()
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let tail_start = raw
+        .char_indices()
+        .find(|(i, _)| *i >= raw.len() - half)
+        .map_or(raw.len(), |(i, _)| i);
+    format!("{}\n[…]\n{}", &raw[..head_end], &raw[tail_start..])
+}
+
+const BACKGROUND_WORK_SUMMARY_SYSTEM: &str = "You are writing a one-paragraph \
+operational note for an assistant's own future recall of background work it \
+just performed in a conversation. Summarize what the tool activity did: the \
+actions taken, the key results, and the concrete identifiers involved (ids, \
+counts, names, addresses). One paragraph, at most 120 words, no preamble, no \
+formatting.";
+
+/// The collapsed note for this turn's tool traffic: a model-written recall
+/// paragraph in `Summary` mode (deterministic digest on any failure), the
+/// digest alone in `Digest` mode.
+async fn background_work_note(
+    mode: zeroclaw_config::schema::ToolContextMode,
+    tool_messages: &[ChatMessage],
+    ctx: &ChannelRuntimeContext,
+) -> Option<String> {
+    let digest = background_work_digest(tool_messages)?;
+    if mode != zeroclaw_config::schema::ToolContextMode::Summary {
+        return Some(digest);
+    }
+    let mut raw = String::new();
+    for msg in tool_messages {
+        raw.push_str(&msg.role);
+        raw.push_str(": ");
+        raw.push_str(&msg.content);
+        raw.push('\n');
+    }
+    let clipped = clip_for_summary(&raw, 6_000);
+    match ctx
+        .model_provider
+        .chat_with_system(
+            Some(BACKGROUND_WORK_SUMMARY_SYSTEM),
+            &clipped,
+            &ctx.model,
+            ctx.temperature,
+        )
+        .await
+    {
+        Ok(text) if !text.trim().is_empty() => {
+            Some(format!("{BACKGROUND_WORK_PREFIX}] {}", text.trim()))
+        }
+        Ok(_) => Some(digest),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "background-work summary failed, keeping the digest"
+            );
+            Some(digest)
+        }
+    }
 }
 
 fn rollback_orphan_user_turn(
@@ -5799,17 +5957,29 @@ async fn process_channel_message_body(
                 "channel_message_outbound"
             );
 
-            // Persist intermediate tool-call/result messages from this turn
-            // so the model retains concrete "I used tools" examples in
-            // context, preventing drift toward tool-less responses.
-            let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
-            if keep_tool_turns > 0 {
-                // Find tool messages for the current turn: everything after
-                // the last user message up to (but not including) the final
-                // assistant response that matches our delivered text.
-                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
-                for tool_msg in tool_messages {
-                    append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
+            // Persist this turn's tool activity into history. `raw` keeps the
+            // full call/result messages so the model retains concrete "I used
+            // tools" examples; `digest`/`summary` collapse them into one
+            // assistant note, so machinery stops evicting conversation from
+            // the bounded history window while the recall (and the "I used
+            // tools" example) survives. Raw messages land before the final
+            // response (their natural order); a note lands after it, so the
+            // summary-mode model call never delays the response's own
+            // persistence into a window where a fast follow-up could
+            // interleave.
+            if let zeroclaw_config::schema::ToolContextMode::Raw =
+                ctx.agent_cfg.resolved.tool_context_mode
+            {
+                let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
+                if keep_tool_turns > 0 {
+                    // Tool messages for the current turn: everything after
+                    // the last user message up to (but not including) the
+                    // final assistant response.
+                    let tool_messages: Vec<ChatMessage> =
+                        extract_current_turn_tool_messages(&history);
+                    for tool_msg in tool_messages {
+                        append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
+                    }
                 }
             }
 
@@ -5819,6 +5989,17 @@ async fn process_channel_message_body(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            let tool_context_mode = ctx.agent_cfg.resolved.tool_context_mode;
+            if tool_context_mode != zeroclaw_config::schema::ToolContextMode::Raw {
+                let tool_messages: Vec<ChatMessage> =
+                    extract_current_turn_tool_messages(&history);
+                if let Some(note) =
+                    background_work_note(tool_context_mode, &tool_messages, ctx.as_ref()).await
+                {
+                    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::assistant(&note));
+                }
+            }
 
             // Fire-and-forget LLM-driven memory consolidation. Passes the
             // agent's resolved temperature through unchanged — `None`
@@ -13113,6 +13294,68 @@ api_key = "anthropic-key"
     fn strip_tool_summary_prefix_returns_empty_when_only_prefix() {
         let input = "[Used tools: browser_open]";
         assert_eq!(strip_tool_summary_prefix(input), "");
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_removes_background_work_echoes() {
+        // A digest echo is the whole bracket — nothing survives.
+        assert_eq!(
+            strip_tool_summary_prefix("[Background work: 3 tool calls — shell x3]"),
+            ""
+        );
+        // A summary echo keeps its paragraph once the marker is gone.
+        assert_eq!(
+            strip_tool_summary_prefix("[Background work] Trashed 52 messages.\nDone."),
+            "Trashed 52 messages.\nDone."
+        );
+    }
+
+    #[test]
+    fn background_work_digest_counts_native_tool_calls() {
+        let msgs = vec![
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"function":{"name":"shell"}},{"function":{"name":"shell"}}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"a","content":"ok"}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"b","content":"ok"}"#),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"name":"google__GMAIL_SEARCH"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"c","content":"ok"}"#),
+        ];
+        assert_eq!(
+            background_work_digest(&msgs).as_deref(),
+            Some("[Background work: 3 tool calls — shell x2, google__GMAIL_SEARCH]")
+        );
+    }
+
+    #[test]
+    fn background_work_digest_reads_prompt_mode_tags() {
+        let msgs = vec![
+            ChatMessage::assistant(r#"<tool_call>{"name":"web_search"}</tool_call>"#),
+            ChatMessage::tool("results"),
+        ];
+        assert_eq!(
+            background_work_digest(&msgs).as_deref(),
+            Some("[Background work: 1 tool call — web_search]")
+        );
+    }
+
+    #[test]
+    fn background_work_digest_counts_unnamed_traffic() {
+        let msgs = vec![
+            ChatMessage::assistant("thinking..."),
+            ChatMessage::tool("raw result"),
+        ];
+        assert_eq!(
+            background_work_digest(&msgs).as_deref(),
+            Some("[Background work: 1 tool call]")
+        );
+    }
+
+    #[test]
+    fn background_work_digest_is_none_without_tool_traffic() {
+        assert_eq!(background_work_digest(&[]), None);
     }
 
     #[test]
