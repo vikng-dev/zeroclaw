@@ -28,7 +28,8 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - uses: docker/build-push-action@v6
+      - name: Build and push the zeroclaw base
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.debian
@@ -36,6 +37,40 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          tags: ghcr.io/vikng-dev/zeroclaw:fleet-base-${{ github.run_number }}
+
+      # The fleet's own packaging layer. It lives HERE, in this fleet-only
+      # workflow, and never as a Dockerfile.debian patch: that file is
+      # upstream's, and every commit on this branch doubles as an upstream
+      # PR. gh + python3 are the ops bot's git lane (uda-fleet
+      # .docs/adr/0017 decided gh CLI + PAT) and the deploy gate it runs
+      # locally (vps/checks.py needs python 3.11+ for tomllib; bookworm
+      # ships 3.11).
+      - name: Write the packaging layer
+        run: |
+          mkdir .fleet-layer
+          cat > .fleet-layer/Dockerfile <<'EOF'
+          ARG BASE
+          FROM ${BASE}
+          USER root
+          RUN apt-get update && apt-get install -y --no-install-recommends python3 \
+           && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+           && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+                > /etc/apt/sources.list.d/github-cli.list \
+           && apt-get update && apt-get install -y --no-install-recommends gh \
+           && rm -rf /var/lib/apt/lists/*
+          USER 65534:65534
+          EOF
+
+      - name: Build and push the fleet image
+        uses: docker/build-push-action@v6
+        with:
+          context: .fleet-layer
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            BASE=ghcr.io/vikng-dev/zeroclaw:fleet-base-${{ github.run_number }}
           tags: |
             ghcr.io/vikng-dev/zeroclaw:fleet-0.8.4.${{ github.run_number }}
             ghcr.io/vikng-dev/zeroclaw:fleet
