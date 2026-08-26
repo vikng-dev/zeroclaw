@@ -1033,14 +1033,18 @@ impl WhatsAppWebChannel {
         String::new()
     }
 
-    /// Build a media claim ticket for a message whose media the passive lane
-    /// deliberately does not download: a base64 JSON descriptor carrying
-    /// exactly what `Client::download_from_params` needs to redeem it later.
-    /// Audio and image only — the kinds the redeem path can render.
+    /// Build a media claim ticket for one message's own media: a base64 JSON
+    /// descriptor carrying exactly what `Client::download_from_params` needs
+    /// to redeem it later. Audio, image and document — the kinds the redeem
+    /// path can fetch. View-once media never becomes a ticket: a durable,
+    /// replayable claim would defeat the sender's one-view intent.
     #[cfg(feature = "whatsapp-web")]
     fn media_ref_descriptor(msg: &waproto::whatsapp::Message) -> Option<String> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use wacore::proto_helpers::MessageExt;
+        if msg.is_view_once() {
+            return None;
+        }
         let base = msg.get_base_message();
         let (kind, mime, dp, mk, es, fs, len) = if let Some(ref a) = base.audio_message {
             (
@@ -1062,6 +1066,16 @@ impl WhatsAppWebChannel {
                 i.file_sha256.clone(),
                 i.file_length,
             )
+        } else if let Some(ref d) = base.document_message {
+            (
+                "document",
+                d.mimetype.clone(),
+                d.direct_path.clone(),
+                d.media_key.clone(),
+                d.file_enc_sha256.clone(),
+                d.file_sha256.clone(),
+                d.file_length,
+            )
         } else {
             return None;
         };
@@ -1076,6 +1090,37 @@ impl WhatsAppWebChannel {
             "mime": mime,
         });
         Some(STANDARD.encode(doc.to_string()))
+    }
+
+    /// Claim tickets for everything redeemable a message carries: its own
+    /// media and its quoted message's media. Both lanes mint these — the
+    /// passive lane because it never downloads, the active lane so media
+    /// stays redeemable after the landed file ages out of retention.
+    #[cfg(feature = "whatsapp-web")]
+    fn media_ref_descriptors(msg: &waproto::whatsapp::Message) -> Vec<String> {
+        let mut descriptors = Vec::new();
+        if let Some(desc) = Self::media_ref_descriptor(msg) {
+            descriptors.push(desc);
+        }
+        if let Some(quoted) = Self::extract_quoted_message(msg)
+            && let Some(desc) = Self::media_ref_descriptor(quoted)
+        {
+            descriptors.push(desc);
+        }
+        descriptors
+    }
+
+    /// Append claim tickets under the content, one line each.
+    #[cfg(feature = "whatsapp-web")]
+    fn append_media_refs(content: String, msg: &waproto::whatsapp::Message) -> String {
+        let mut content = content;
+        for desc in Self::media_ref_descriptors(msg) {
+            content = format!(
+                "{content}\n{}{desc}]",
+                zeroclaw_api::media_ref::MEDIA_REF_PREFIX
+            );
+        }
+        content
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1842,8 +1887,8 @@ impl Channel for WhatsAppWebChannel {
         let raw = STANDARD
             .decode(descriptor.trim())
             .map_err(|_| anyhow::anyhow!("malformed media descriptor"))?;
-        let doc: serde_json::Value =
-            serde_json::from_slice(&raw).map_err(|_| anyhow::anyhow!("malformed media descriptor"))?;
+        let doc: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|_| anyhow::anyhow!("malformed media descriptor"))?;
         let field = |name: &str| {
             doc.get(name)
                 .and_then(serde_json::Value::as_str)
@@ -1853,6 +1898,7 @@ impl Channel for WhatsAppWebChannel {
         let media_type = match kind.as_str() {
             "audio" => wacore::download::MediaType::Audio,
             "image" => wacore::download::MediaType::Image,
+            "document" => wacore::download::MediaType::Document,
             other => anyhow::bail!("unsupported media kind '{other}' in descriptor"),
         };
         let dp = field("dp").ok_or_else(|| anyhow::anyhow!("descriptor missing direct path"))?;
@@ -1865,7 +1911,10 @@ impl Channel for WhatsAppWebChannel {
         let fs = field("fs")
             .and_then(|v| STANDARD.decode(v).ok())
             .unwrap_or_default();
-        let len = doc.get("len").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let len = doc
+            .get("len")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         let mime = field("mime");
 
         let data = client
@@ -1878,8 +1927,7 @@ impl Channel for WhatsAppWebChannel {
 
     async fn fetch_media(&self, descriptor: &str) -> Result<String> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
-        let FetchedMedia { kind, mime, data } =
-            self.fetch_media_bytes(descriptor).await?;
+        let FetchedMedia { kind, mime, data } = self.fetch_media_bytes(descriptor).await?;
 
         if kind == "audio" {
             let Some(manager) = self.transcription_manager.as_deref() else {
@@ -2505,14 +2553,9 @@ impl Channel for WhatsAppWebChannel {
                                         return;
                                     }
                                     // Media stays undownloaded on this lane;
-                                    // the claim ticket lets a later
+                                    // the claim tickets let a later
                                     // fetch_media call redeem it.
-                                    if let Some(desc) = Self::media_ref_descriptor(msg) {
-                                        content = format!(
-                                            "{content}\n{}{desc}]",
-                                            zeroclaw_api::media_ref::MEDIA_REF_PREFIX
-                                        );
-                                    }
+                                    content = Self::append_media_refs(content, msg);
                                     Self::send_inbound_channel_message(
                                         &tx_inner,
                                         alias.as_ref(),
@@ -2612,6 +2655,13 @@ impl Channel for WhatsAppWebChannel {
                                     )
                                     .await;
                                 }
+
+                                // Tickets ride under the addressed turn too:
+                                // the attachment bytes above serve THIS turn,
+                                // the ticket keeps the media redeemable later
+                                // (save to a file, re-view after the landed
+                                // copy ages out).
+                                content = Self::append_media_refs(content, msg);
 
                                 Self::send_inbound_channel_message(
                                     &tx_inner,
@@ -3055,6 +3105,71 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_ref_descriptors_cover_primary_quoted_document_and_skip_view_once() {
+        fn image_msg() -> waproto::whatsapp::ImageMessage {
+            waproto::whatsapp::ImageMessage {
+                direct_path: Some("/v/x".into()),
+                media_key: Some(vec![1]),
+                file_enc_sha256: Some(vec![2]),
+                mimetype: Some("image/jpeg".into()),
+                ..Default::default()
+            }
+        }
+
+        // Primary image only.
+        let msg = waproto::whatsapp::Message {
+            image_message: Some(Box::new(image_msg())),
+            ..Default::default()
+        };
+        assert_eq!(WhatsAppWebChannel::media_ref_descriptors(&msg).len(), 1);
+
+        // A reply whose quoted message carries the image: quoted ticket minted.
+        let quoting = waproto::whatsapp::Message {
+            extended_text_message: Some(Box::new(waproto::whatsapp::ExtendedTextMessage {
+                text: Some("save it".into()),
+                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                    quoted_message: Some(Box::new(msg.clone())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(WhatsAppWebChannel::media_ref_descriptors(&quoting).len(), 1);
+
+        // Documents are redeemable too.
+        let doc = waproto::whatsapp::Message {
+            document_message: Some(Box::new(waproto::whatsapp::DocumentMessage {
+                direct_path: Some("/v/d".into()),
+                media_key: Some(vec![1]),
+                file_enc_sha256: Some(vec![2]),
+                mimetype: Some("application/pdf".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let descs = WhatsAppWebChannel::media_ref_descriptors(&doc);
+        assert_eq!(descs.len(), 1);
+        assert_eq!(
+            zeroclaw_api::media_ref::summarize_media_ref(&descs[0])
+                .expect("valid ticket")
+                .kind,
+            "document"
+        );
+
+        // View-once media never becomes a durable, replayable claim.
+        let view_once = waproto::whatsapp::Message {
+            image_message: Some(Box::new(waproto::whatsapp::ImageMessage {
+                view_once: Some(true),
+                ..image_msg()
+            })),
+            ..Default::default()
+        };
+        assert!(WhatsAppWebChannel::media_ref_descriptors(&view_once).is_empty());
+    }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]

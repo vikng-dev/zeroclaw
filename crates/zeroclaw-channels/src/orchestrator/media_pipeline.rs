@@ -105,10 +105,18 @@ impl<'a> MediaPipeline<'a> {
     /// The raw audio also lands as a file when a files root is set, so "save
     /// that voice note" stays possible after the transcription is delivered.
     async fn process_audio(&self, attachment: &MediaAttachment) -> String {
-        let saved = self.save_attachment(&attachment.file_name, &attachment.data).await;
+        let saved = self
+            .save_attachment(&attachment.file_name, &attachment.data)
+            .await;
         let file_note = saved
             .as_deref()
-            .map(|p| format!("\n[Audio file: {} saved at {}]", attachment.file_name, p.display()))
+            .map(|p| {
+                format!(
+                    "\n[Audio file: {} saved at {}]",
+                    attachment.file_name,
+                    p.display()
+                )
+            })
             .unwrap_or_default();
 
         let Some(manager) = self.transcription_manager else {
@@ -151,7 +159,10 @@ impl<'a> MediaPipeline<'a> {
                     attachment.file_name
                 )
             } else {
-                format!("[Image: {} attached, saved at {shown}]", attachment.file_name)
+                format!(
+                    "[Image: {} attached, saved at {shown}]",
+                    attachment.file_name
+                )
             };
         }
         if self.vision_available {
@@ -169,7 +180,10 @@ impl<'a> MediaPipeline<'a> {
     /// Video analysis requires external APIs not currently integrated,
     /// but the bytes still land as a reusable file when a root is set.
     async fn process_video(&self, attachment: &MediaAttachment) -> String {
-        match self.save_attachment(&attachment.file_name, &attachment.data).await {
+        match self
+            .save_attachment(&attachment.file_name, &attachment.data)
+            .await
+        {
             Some(path) => format!(
                 "[Video: {} attached, saved at {}]",
                 attachment.file_name,
@@ -208,7 +222,11 @@ impl<'a> MediaPipeline<'a> {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"dir": root.display().to_string(), "error": format!("{}", err)})), "Media pipeline: cannot create files dir");
             return None;
         }
-        sweep_old_files(root, Duration::from_secs(self.config.retention_hours.saturating_mul(3600))).await;
+        sweep_old_files(
+            root,
+            Duration::from_secs(self.config.retention_hours.saturating_mul(3600)),
+        )
+        .await;
 
         let path = unique_media_path(root, file_name).await;
         match tokio::fs::write(&path, data).await {
@@ -602,8 +620,8 @@ mod tests {
     async fn image_lands_as_file_with_path_marker_for_vision() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = default_pipeline_config(true);
-        let pipeline = MediaPipeline::new(&config, None, true)
-            .with_files_root(Some(dir.path().to_path_buf()));
+        let pipeline =
+            MediaPipeline::new(&config, None, true).with_files_root(Some(dir.path().to_path_buf()));
 
         let result = pipeline.process("check this", &[sample_image()]).await;
 

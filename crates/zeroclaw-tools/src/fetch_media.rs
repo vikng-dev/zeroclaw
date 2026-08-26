@@ -115,14 +115,13 @@ impl Tool for FetchMediaTool {
     }
 
     fn description(&self) -> &str {
-        "Retrieve media from this conversation's recent history that was not \
-         downloaded at receive time (voice notes, images from group messages). \
-         History shows such items as '[undownloaded audio — id XXXXXXXX ...]'. \
-         Pass that id, or omit it to redeem the most recent item(s). \
-         mode=\"view\" (default) returns a transcription for audio and the \
-         image itself for images; mode=\"save\" writes the raw bytes to a \
-         file and returns its path, for uploading or storing the media \
-         somewhere."
+        "Retrieve media (images, voice notes, documents) from this \
+         conversation's recent history. History shows redeemable items as \
+         '[media image — id XXXXXXXX ...]'. Pass that id, or omit it to \
+         redeem the most recent item(s). mode=\"view\" (default) returns a \
+         transcription for audio and the image itself for images; \
+         mode=\"save\" writes the raw bytes to a file and returns its path, \
+         for uploading or storing the media somewhere."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -139,7 +138,7 @@ impl Tool for FetchMediaTool {
                 },
                 "last": {
                     "type": "integer",
-                    "description": "Redeem the N most recent undownloaded items (default 1)"
+                    "description": "Redeem the N most recent redeemable items (default 1)"
                 },
                 "mode": {
                     "type": "string",
@@ -248,8 +247,8 @@ impl Tool for FetchMediaTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(match id {
-                    Some(id) => format!("no undownloaded media with id '{id}' in recent history"),
-                    None => "no undownloaded media in recent history".to_string(),
+                    Some(id) => format!("no redeemable media with id '{id}' in recent history"),
+                    None => "no redeemable media in recent history".to_string(),
                 }),
             });
         }
@@ -301,26 +300,36 @@ impl Tool for FetchMediaTool {
                 continue;
             }
 
-            // View. Images spool to disk and return a short re-loadable
-            // [IMAGE:<path>] marker — an inline data URI would be dropped
-            // whole by tool-result truncation. Audio (transcription) and
-            // anything else keeps the channel's own rendering.
-            if kind == "image" {
-                if let Ok(media) = channel.fetch_media_bytes(payload).await {
-                    if let Ok(path) = self
-                        .land_bytes(&short_id, media.mime.as_deref(), &media.kind, &media.data)
-                        .await
-                    {
-                        let _ = writeln!(
-                            output,
-                            "[{label}]\n[IMAGE:{}]\n(also on disk at that path for file tools)\n",
-                            path.display()
-                        );
-                        continue;
-                    }
+            // View. Non-audio media spools to disk: images return a short
+            // re-loadable [IMAGE:<path>] marker — an inline data URI would be
+            // dropped whole by tool-result truncation — and documents return
+            // their landed path for the file tools. Audio (transcription)
+            // keeps the channel's own rendering.
+            if kind != "audio"
+                && let Ok(media) = channel.fetch_media_bytes(payload).await
+                && let Ok(path) = self
+                    .land_bytes(&short_id, media.mime.as_deref(), &media.kind, &media.data)
+                    .await
+            {
+                if kind == "image" {
+                    let _ = writeln!(
+                        output,
+                        "[{label}]\n[IMAGE:{}]\n(also on disk at that path for file tools)\n",
+                        path.display()
+                    );
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "[{label}] on disk at {} ({}, {} bytes) — read it with file tools\n",
+                        path.display(),
+                        media.mime.as_deref().unwrap_or("unknown type"),
+                        media.data.len()
+                    );
                 }
-                // fall through to the channel renderer on any failure
+                continue;
             }
+            // Anything else — audio, or a failed land — goes to the
+            // channel's own renderer.
             match channel.fetch_media(payload).await {
                 Ok(text) => {
                     let _ = writeln!(output, "[{label}]\n{text}\n");
@@ -351,8 +360,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     fn ticket(kind: &str, es: &str) -> String {
-        let payload =
-            STANDARD.encode(format!(r#"{{"v":1,"k":"{kind}","es":"{es}","dp":"/x"}}"#));
+        let payload = STANDARD.encode(format!(r#"{{"v":1,"k":"{kind}","es":"{es}","dp":"/x"}}"#));
         format!("[WA-MEDIA:{payload}]")
     }
 
@@ -390,7 +398,10 @@ mod tests {
     #[test]
     fn extension_prefers_mime_and_falls_back_to_kind() {
         assert_eq!(extension_for(Some("image/jpeg"), "image"), "jpg");
-        assert_eq!(extension_for(Some("audio/ogg; codecs=opus"), "audio"), "ogg");
+        assert_eq!(
+            extension_for(Some("audio/ogg; codecs=opus"), "audio"),
+            "ogg"
+        );
         assert_eq!(extension_for(None, "image"), "jpg");
         assert_eq!(extension_for(None, "audio"), "ogg");
         assert_eq!(extension_for(Some("application/x-thing"), ""), "bin");

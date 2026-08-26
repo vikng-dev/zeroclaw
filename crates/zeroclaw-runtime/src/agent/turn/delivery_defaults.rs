@@ -16,7 +16,8 @@ const AUTO_DELIVERY_DEFAULT_CHANNELS: &[&str] = &[
 /// default they can route an interactive prompt to a random external channel
 /// while the user is sitting in the RPC/ACP/WS session that issued the turn —
 /// which looks like a hang until timeout/cancel.
-const ORIGINATING_CHANNEL_TOOLS: &[&str] = &["ask_user", "poll", "escalate_to_human", "fetch_media"];
+const ORIGINATING_CHANNEL_TOOLS: &[&str] =
+    &["ask_user", "poll", "escalate_to_human", "fetch_media"];
 
 /// When `tool_args` omits `channel`, fill it from the turn's originating
 /// channel name so interactive tools prefer the conversation back-channel

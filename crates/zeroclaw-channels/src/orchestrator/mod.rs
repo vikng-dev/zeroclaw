@@ -1214,13 +1214,16 @@ fn collapse_inline_image_payloads(turns: &mut [ChatMessage]) {
 /// descriptor is left untouched.
 fn collapse_media_ref_markers(turns: &mut [ChatMessage]) {
     for turn in turns.iter_mut() {
-        if !turn.content.contains(zeroclaw_api::media_ref::MEDIA_REF_PREFIX) {
+        if !turn
+            .content
+            .contains(zeroclaw_api::media_ref::MEDIA_REF_PREFIX)
+        {
             continue;
         }
         turn.content = zeroclaw_api::media_ref::replace_media_refs(&turn.content, |payload| {
             zeroclaw_api::media_ref::summarize_media_ref(payload).map(|s| {
                 format!(
-                    "[undownloaded {} — id {} — the fetch_media tool can retrieve it]",
+                    "[media {} — id {} — fetch_media can view it or save it to a file]",
                     s.kind, s.id
                 )
             })
@@ -6024,8 +6027,7 @@ async fn process_channel_message_body(
 
             let tool_context_mode = ctx.agent_cfg.resolved.tool_context_mode;
             if tool_context_mode != zeroclaw_config::schema::ToolContextMode::Raw {
-                let tool_messages: Vec<ChatMessage> =
-                    extract_current_turn_tool_messages(&history);
+                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
                 if let Some(note) =
                     background_work_note(tool_context_mode, &tool_messages, ctx.as_ref()).await
                 {
@@ -13353,7 +13355,7 @@ api_key = "anthropic-key"
         collapse_media_ref_markers(&mut turns);
         assert_eq!(
             turns[0].content,
-            "[Voice]\n[undownloaded audio — id AbCdEfGh — the fetch_media tool can retrieve it]"
+            "[Voice]\n[media audio — id AbCdEfGh — fetch_media can view it or save it to a file]"
         );
         assert_eq!(turns[1].content, "typed [WA-MEDIA:not-a-ticket] stays");
     }
@@ -23300,7 +23302,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_persists_image_payload_verbatim() {
+    async fn process_channel_message_lands_image_as_file_and_references_path() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -23428,10 +23430,14 @@ BTC is currently around $65,000 based on latest tool output."#
             .rev()
             .find(|(role, _)| role == "user")
             .expect("provider call should include current user message");
-        assert!(current_user.1.contains("[IMAGE:data:image/png;base64,"));
+        // The provider still receives the pixels (multimodal re-inflates the
+        // landed file), so the vision flow is intact end to end.
+        assert!(current_user.1.contains("[IMAGE:"));
         assert!(current_user.1.contains("please inspect this"));
         drop(calls);
 
+        // The persisted turn references the landed file by path — no inline
+        // base64 enters history — and the file carries the original bytes.
         let histories = runtime_ctx
             .conversation_histories
             .lock()
@@ -23443,8 +23449,23 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.starts_with('['));
         assert!(turns[0].content.contains("[Image: sticker.png attached"));
         assert!(turns[0].content.contains("please inspect this"));
-        assert!(turns[0].content.contains("[IMAGE:data:"));
-        assert!(turns[0].content.contains("AQIDBA"));
+        assert!(
+            !turns[0].content.contains("[IMAGE:data:"),
+            "persisted history must not carry base64, got: {}",
+            turns[0].content
+        );
+        let marker_path = turns[0]
+            .content
+            .split("[IMAGE:")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("path marker present in history")
+            .to_string();
+        assert_eq!(
+            std::fs::read(&marker_path).expect("landed file readable"),
+            vec![1, 2, 3, 4]
+        );
+        let _ = std::fs::remove_file(&marker_path);
     }
 
     #[tokio::test]
