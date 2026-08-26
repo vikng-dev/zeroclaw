@@ -8,6 +8,7 @@
 use crate::reaction::ChannelMapHandle;
 use serde_json::json;
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 use zeroclaw_api::media_ref::{extract_media_refs, summarize_media_ref};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -23,6 +24,12 @@ pub struct FetchMediaTool {
     security: Arc<SecurityPolicy>,
     channels: ChannelMapHandle,
     backend: Arc<dyn SessionBackend>,
+    /// Where redeemed media lands as files (`media_pipeline.files_dir`,
+    /// falling back to `<workspace>/media_files`). `view` spools images here
+    /// so the result is a short re-loadable `[IMAGE:<path>]` marker instead
+    /// of a data URI that outgrows tool-result truncation; `save` writes the
+    /// durable file it exists to produce.
+    files_root: PathBuf,
 }
 
 impl FetchMediaTool {
@@ -30,12 +37,50 @@ impl FetchMediaTool {
         security: Arc<SecurityPolicy>,
         channels: ChannelMapHandle,
         backend: Arc<dyn SessionBackend>,
+        files_root: PathBuf,
     ) -> Self {
         Self {
             security,
             channels,
             backend,
+            files_root,
         }
+    }
+
+    /// Land redeemed bytes as a file, named by the ticket's short id so
+    /// repeated redemptions of one ticket overwrite rather than accumulate.
+    async fn land_bytes(
+        &self,
+        id: &str,
+        mime: Option<&str>,
+        kind: &str,
+        data: &[u8],
+    ) -> anyhow::Result<PathBuf> {
+        tokio::fs::create_dir_all(&self.files_root).await?;
+        let path = self
+            .files_root
+            .join(format!("{id}.{}", extension_for(mime, kind)));
+        tokio::fs::write(&path, data).await?;
+        Ok(path)
+    }
+}
+
+/// File extension for a redeemed ticket, from its MIME type with the
+/// descriptor kind as fallback.
+fn extension_for(mime: Option<&str>, kind: &str) -> &'static str {
+    match mime.unwrap_or_default() {
+        m if m.contains("jpeg") || m.contains("jpg") => "jpg",
+        m if m.contains("png") => "png",
+        m if m.contains("webp") => "webp",
+        m if m.contains("gif") => "gif",
+        m if m.contains("mp4") || m.contains("m4a") => "m4a",
+        m if m.contains("mpeg") || m.contains("mp3") => "mp3",
+        m if m.contains("ogg") || m.contains("opus") => "ogg",
+        m if m.contains("webm") => "webm",
+        m if m.contains("pdf") => "pdf",
+        _ if kind == "image" => "jpg",
+        _ if kind == "audio" => "ogg",
+        _ => "bin",
     }
 }
 
@@ -73,8 +118,11 @@ impl Tool for FetchMediaTool {
         "Retrieve media from this conversation's recent history that was not \
          downloaded at receive time (voice notes, images from group messages). \
          History shows such items as '[undownloaded audio — id XXXXXXXX ...]'. \
-         Pass that id, or omit it to redeem the most recent item(s). Returns a \
-         transcription for audio and the image itself for images."
+         Pass that id, or omit it to redeem the most recent item(s). \
+         mode=\"view\" (default) returns a transcription for audio and the \
+         image itself for images; mode=\"save\" writes the raw bytes to a \
+         file and returns its path, for uploading or storing the media \
+         somewhere."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -92,6 +140,11 @@ impl Tool for FetchMediaTool {
                 "last": {
                     "type": "integer",
                     "description": "Redeem the N most recent undownloaded items (default 1)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["view", "save"],
+                    "description": "view (default): render for reading — transcription or inline image. save: write the raw bytes to a file and return the path."
                 }
             },
             "required": []
@@ -99,9 +152,31 @@ impl Tool for FetchMediaTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let mode = args
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("view");
+        let save = match mode {
+            "save" => true,
+            "view" => false,
+            other => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("unknown mode '{other}': use \"view\" or \"save\"")),
+                });
+            }
+        };
+        // Viewing is a read; saving creates a file on disk, so it is gated as
+        // a state-changing operation.
+        let operation = if save {
+            ToolOperation::Act
+        } else {
+            ToolOperation::Read
+        };
         if let Err(error) = self
             .security
-            .enforce_tool_operation(ToolOperation::Read, "fetch_media")
+            .enforce_tool_operation(operation, "fetch_media")
         {
             return Ok(ToolResult {
                 success: false,
@@ -180,11 +255,72 @@ impl Tool for FetchMediaTool {
         }
 
         let mut output = String::new();
+        let mut saved = Vec::new();
         let mut failures = 0usize;
         for payload in &selected {
-            let label = summarize_media_ref(payload)
-                .map(|s| format!("{} {}", s.kind, s.id))
-                .unwrap_or_else(|| "media".to_string());
+            let summary = summarize_media_ref(payload);
+            let (label, short_id, kind) = summary
+                .as_ref()
+                .map(|s| (format!("{} {}", s.kind, s.id), s.id.clone(), s.kind.clone()))
+                .unwrap_or_else(|| ("media".to_string(), "media".to_string(), String::new()));
+
+            if save {
+                match channel.fetch_media_bytes(payload).await {
+                    Ok(media) => {
+                        match self
+                            .land_bytes(&short_id, media.mime.as_deref(), &media.kind, &media.data)
+                            .await
+                        {
+                            Ok(path) => {
+                                let _ = writeln!(
+                                    output,
+                                    "[{label}] saved: {} ({}, {} bytes)\n",
+                                    path.display(),
+                                    media.mime.as_deref().unwrap_or("unknown type"),
+                                    media.data.len()
+                                );
+                                saved.push(json!({
+                                    "id": short_id,
+                                    "kind": media.kind,
+                                    "mime": media.mime,
+                                    "bytes": media.data.len(),
+                                    "path": path.display().to_string(),
+                                }));
+                            }
+                            Err(e) => {
+                                failures += 1;
+                                let _ = writeln!(output, "[{label}] save failed: {e}\n");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        let _ = writeln!(output, "[{label}] retrieval failed: {e}\n");
+                    }
+                }
+                continue;
+            }
+
+            // View. Images spool to disk and return a short re-loadable
+            // [IMAGE:<path>] marker — an inline data URI would be dropped
+            // whole by tool-result truncation. Audio (transcription) and
+            // anything else keeps the channel's own rendering.
+            if kind == "image" {
+                if let Ok(media) = channel.fetch_media_bytes(payload).await {
+                    if let Ok(path) = self
+                        .land_bytes(&short_id, media.mime.as_deref(), &media.kind, &media.data)
+                        .await
+                    {
+                        let _ = writeln!(
+                            output,
+                            "[{label}]\n[IMAGE:{}]\n(also on disk at that path for file tools)\n",
+                            path.display()
+                        );
+                        continue;
+                    }
+                }
+                // fall through to the channel renderer on any failure
+            }
             match channel.fetch_media(payload).await {
                 Ok(text) => {
                     let _ = writeln!(output, "[{label}]\n{text}\n");
@@ -195,9 +331,15 @@ impl Tool for FetchMediaTool {
                 }
             }
         }
+        let text = output.trim_end().to_string();
+        let output = if saved.is_empty() {
+            text.into()
+        } else {
+            ToolOutput::json_with_text(json!({ "saved": saved }), text)
+        };
         Ok(ToolResult {
             success: failures < selected.len(),
-            output: output.trim_end().to_string().into(),
+            output,
             error: None,
         })
     }
@@ -243,5 +385,14 @@ mod tests {
     fn ignores_user_typed_lookalikes() {
         let rows = vec!["fake [WA-MEDIA:not-a-ticket] here".to_string()];
         assert!(select_media_refs(&rows, None, 3).is_empty());
+    }
+
+    #[test]
+    fn extension_prefers_mime_and_falls_back_to_kind() {
+        assert_eq!(extension_for(Some("image/jpeg"), "image"), "jpg");
+        assert_eq!(extension_for(Some("audio/ogg; codecs=opus"), "audio"), "ogg");
+        assert_eq!(extension_for(None, "image"), "jpg");
+        assert_eq!(extension_for(None, "audio"), "ogg");
+        assert_eq!(extension_for(Some("application/x-thing"), ""), "bin");
     }
 }

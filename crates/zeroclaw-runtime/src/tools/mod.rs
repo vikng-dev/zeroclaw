@@ -1254,14 +1254,22 @@ pub fn all_tools_with_runtime(
 
     // Media claim-ticket redemption: reads [WA-MEDIA:...] descriptors out of
     // the current chat's persisted history and asks the owning channel (via
-    // the same late-bound map) to download and render them.
+    // the same late-bound map) to download and render them. Redeemed files
+    // land where the media pipeline lands inbound attachments.
     if let Ok(backend) =
         zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
+        let media_files_root = config
+            .media_pipeline
+            .files_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| security.workspace_dir.join("media_files"));
         tool_arcs.push(Arc::new(FetchMediaTool::new(
             security.clone(),
             Arc::clone(&reaction_handle),
             backend,
+            media_files_root,
         )));
     }
 

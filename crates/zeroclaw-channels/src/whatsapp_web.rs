@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::select;
 use waproto::whatsapp::device_props::PlatformType;
-use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{
+    Channel, ChannelConversationScope, ChannelMessage, FetchedMedia, SendMessage,
+};
 #[cfg(feature = "whatsapp-web")]
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
@@ -1831,7 +1833,7 @@ impl Channel for WhatsAppWebChannel {
         "whatsapp"
     }
 
-    async fn fetch_media(&self, descriptor: &str) -> Result<String> {
+    async fn fetch_media_bytes(&self, descriptor: &str) -> Result<FetchedMedia> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let client = self.client.lock().clone();
         let Some(client) = client else {
@@ -1870,6 +1872,14 @@ impl Channel for WhatsAppWebChannel {
             .download_from_params(&dp, &mk, &fs, &es, len, media_type)
             .await
             .map_err(|e| anyhow::anyhow!("media download failed: {e}"))?;
+
+        Ok(FetchedMedia { kind, mime, data })
+    }
+
+    async fn fetch_media(&self, descriptor: &str) -> Result<String> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let FetchedMedia { kind, mime, data } =
+            self.fetch_media_bytes(descriptor).await?;
 
         if kind == "audio" {
             let Some(manager) = self.transcription_manager.as_deref() else {

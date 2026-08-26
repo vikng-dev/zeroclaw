@@ -273,6 +273,15 @@ pub struct ChannelMessage {
     pub conversation_scope: ChannelConversationScope,
 }
 
+/// Raw bytes behind a redeemed media claim ticket (`Channel::fetch_media_bytes`).
+#[derive(Debug, Clone)]
+pub struct FetchedMedia {
+    /// Descriptor kind: "image", "audio", …
+    pub kind: String,
+    pub mime: Option<String>,
+    pub data: Vec<u8>,
+}
+
 /// Message to send through a channel
 #[derive(Debug, Clone)]
 pub struct SendMessage {
@@ -706,6 +715,13 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// an inline image marker, or a note. Channels that never mint
     /// descriptors keep the default refusal.
     async fn fetch_media(&self, _descriptor: &str) -> anyhow::Result<String> {
+        anyhow::bail!("this channel cannot retrieve referenced media")
+    }
+
+    /// Redeem a media claim ticket to raw bytes, for callers that need a
+    /// file rather than agent-readable text (saving, uploading). Channels
+    /// that never mint descriptors keep the default refusal.
+    async fn fetch_media_bytes(&self, _descriptor: &str) -> anyhow::Result<FetchedMedia> {
         anyhow::bail!("this channel cannot retrieve referenced media")
     }
 
