@@ -2,6 +2,8 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use zeroclaw_config::schema::MediaPipelineConfig;
 
 use super::super::transcription::TranscriptionManager;
@@ -16,6 +18,7 @@ pub struct MediaPipeline<'a> {
     config: &'a MediaPipelineConfig,
     transcription_manager: Option<&'a TranscriptionManager>,
     vision_available: bool,
+    files_root: Option<PathBuf>,
 }
 
 impl<'a> MediaPipeline<'a> {
@@ -32,7 +35,19 @@ impl<'a> MediaPipeline<'a> {
             config,
             transcription_manager,
             vision_available,
+            files_root: None,
         }
+    }
+
+    /// Land attachment bytes as files under `root` so annotations can carry a
+    /// path instead of megabytes of base64: the persisted turn stays small,
+    /// vision re-inflates `[IMAGE:<path>]` from disk, and the agent's file
+    /// tools can reuse the file (upload, move, read). Without a root the
+    /// pipeline keeps its inline/announce-only behavior.
+    #[must_use]
+    pub fn with_files_root(mut self, root: Option<PathBuf>) -> Self {
+        self.files_root = root;
+        self
     }
 
     /// Process a message's attachments and return enriched text.
@@ -51,15 +66,15 @@ impl<'a> MediaPipeline<'a> {
                     annotations.push(annotation);
                 }
                 MediaKind::Image if self.config.describe_images => {
-                    let annotation = self.process_image(attachment);
+                    let annotation = self.process_image(attachment).await;
                     annotations.push(annotation);
                 }
                 MediaKind::Video if self.config.summarize_video => {
-                    let annotation = self.process_video(attachment);
+                    let annotation = self.process_video(attachment).await;
                     annotations.push(annotation);
                 }
                 MediaKind::Document if self.config.announce_documents => {
-                    annotations.push(Self::process_document(attachment));
+                    annotations.push(self.process_document(attachment).await);
                 }
                 _ => {}
             }
@@ -87,9 +102,17 @@ impl<'a> MediaPipeline<'a> {
     }
 
     /// Transcribe an audio attachment using the existing transcription infra.
+    /// The raw audio also lands as a file when a files root is set, so "save
+    /// that voice note" stays possible after the transcription is delivered.
     async fn process_audio(&self, attachment: &MediaAttachment) -> String {
+        let saved = self.save_attachment(&attachment.file_name, &attachment.data).await;
+        let file_note = saved
+            .as_deref()
+            .map(|p| format!("\n[Audio file: {} saved at {}]", attachment.file_name, p.display()))
+            .unwrap_or_default();
+
         let Some(manager) = self.transcription_manager else {
-            return "[Audio: attached]".to_string();
+            return format!("[Audio: attached]{file_note}");
         };
 
         match manager
@@ -99,21 +122,39 @@ impl<'a> MediaPipeline<'a> {
             Ok(text) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
-                    "[Audio transcription: (empty)]".to_string()
+                    format!("[Audio transcription: (empty)]{file_note}")
                 } else {
-                    format!("[Audio transcription: {trimmed}]")
+                    format!("[Audio transcription: {trimmed}]{file_note}")
                 }
             }
             Err(err) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"file": attachment.file_name, "error": format!("{}", err)})), "Media pipeline: audio transcription failed");
-                "[Audio: transcription failed]".to_string()
+                format!("[Audio: transcription failed]{file_note}")
             }
         }
     }
 
-    fn process_image(&self, attachment: &MediaAttachment) -> String {
+    /// Annotate an image. With a files root the (vision-normalized) bytes land
+    /// on disk and the annotation carries `[IMAGE:<path>]` — the provider
+    /// layer re-inflates path markers from disk, the persisted turn stays a
+    /// couple of hundred bytes instead of megabytes of base64, and the path
+    /// is real input for file tools ("upload this to Drive"). Inline base64
+    /// remains the fallback when no root is set or the write fails.
+    async fn process_image(&self, attachment: &MediaAttachment) -> String {
+        let (mime, data) = image_payload_for_vision(attachment);
+        let file_name = image_file_name(&attachment.file_name, &mime);
+        if let Some(path) = self.save_attachment(&file_name, data.as_ref()).await {
+            let shown = path.display();
+            return if self.vision_available {
+                format!(
+                    "[Image: {} attached, saved at {shown} — the path works with file tools]\n[IMAGE:{shown}]",
+                    attachment.file_name
+                )
+            } else {
+                format!("[Image: {} attached, saved at {shown}]", attachment.file_name)
+            };
+        }
         if self.vision_available {
-            let (mime, data) = image_payload_for_vision(attachment);
             let b64 = STANDARD.encode(data.as_ref());
             format!(
                 "[Image: {} attached, will be processed by vision model]\n[IMAGE:data:{};base64,{}]",
@@ -125,22 +166,136 @@ impl<'a> MediaPipeline<'a> {
     }
 
     /// Summarize a video attachment.
-    /// Video analysis requires external APIs not currently integrated.
-    /// For now we add a placeholder annotation.
-    fn process_video(&self, attachment: &MediaAttachment) -> String {
-        format!("[Video: {} attached]", attachment.file_name)
+    /// Video analysis requires external APIs not currently integrated,
+    /// but the bytes still land as a reusable file when a root is set.
+    async fn process_video(&self, attachment: &MediaAttachment) -> String {
+        match self.save_attachment(&attachment.file_name, &attachment.data).await {
+            Some(path) => format!(
+                "[Video: {} attached, saved at {}]",
+                attachment.file_name,
+                path.display()
+            ),
+            None => format!("[Video: {} attached]", attachment.file_name),
+        }
     }
 
     /// Announce a document. There is no extraction step: the point is that the
-    /// agent learns a file arrived and what it is, instead of reading a bare
-    /// `[Document]` marker with no name, type or size behind it.
-    fn process_document(attachment: &MediaAttachment) -> String {
+    /// agent learns a file arrived, what it is, and (with a files root) where
+    /// its bytes are, instead of reading a bare `[Document]` marker.
+    async fn process_document(&self, attachment: &MediaAttachment) -> String {
         let mut annotation = format!("[Document: {} attached", attachment.file_name);
         if let Some(ref mime) = attachment.mime_type {
             annotation.push_str(&format!(", type {mime}"));
         }
-        annotation.push_str(&format!(", {} bytes]", attachment.data.len()));
+        annotation.push_str(&format!(", {} bytes", attachment.data.len()));
+        if let Some(path) = self
+            .save_attachment(&attachment.file_name, &attachment.data)
+            .await
+        {
+            annotation.push_str(&format!(", saved at {}", path.display()));
+        }
+        annotation.push(']');
         annotation
+    }
+
+    /// Write attachment bytes under the files root, returning the landed
+    /// path. `None` when no root is configured or the write fails — callers
+    /// fall back to their inline/announce-only annotation. Old files are
+    /// swept opportunistically on the way past.
+    async fn save_attachment(&self, file_name: &str, data: &[u8]) -> Option<PathBuf> {
+        let root = self.files_root.as_ref()?;
+        if let Err(err) = tokio::fs::create_dir_all(root).await {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"dir": root.display().to_string(), "error": format!("{}", err)})), "Media pipeline: cannot create files dir");
+            return None;
+        }
+        sweep_old_files(root, Duration::from_secs(self.config.retention_hours.saturating_mul(3600))).await;
+
+        let path = unique_media_path(root, file_name).await;
+        match tokio::fs::write(&path, data).await {
+            Ok(()) => Some(path),
+            Err(err) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": path.display().to_string(), "error": format!("{}", err)})), "Media pipeline: failed to save attachment");
+                None
+            }
+        }
+    }
+}
+
+/// A collision-free landing path: `<millis>_<sanitized name>`, with a counter
+/// suffix in the (already unlikely) same-millisecond same-name case.
+async fn unique_media_path(root: &Path, file_name: &str) -> PathBuf {
+    let safe = sanitize_file_name(file_name);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut candidate = root.join(format!("{millis}_{safe}"));
+    let mut counter = 1u32;
+    while tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+        candidate = root.join(format!("{millis}-{counter}_{safe}"));
+        counter += 1;
+    }
+    candidate
+}
+
+/// Keep only the final path component and replace anything outside
+/// `[A-Za-z0-9._-]` so a platform-supplied name can never traverse or need
+/// shell quoting.
+fn sanitize_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(['.', '_']).to_string();
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// The saved image file's name must match the bytes actually written:
+/// vision normalization can turn a `.webp` into PNG bytes.
+fn image_file_name(original: &str, mime: &str) -> String {
+    if mime.eq_ignore_ascii_case("image/png") && !original.to_ascii_lowercase().ends_with(".png") {
+        let stem = original.rsplit_once('.').map_or(original, |(stem, _)| stem);
+        format!("{stem}.png")
+    } else {
+        original.to_string()
+    }
+}
+
+/// Best-effort removal of landed files older than `max_age`. Errors are
+/// ignored: retention is hygiene, not correctness, and the next write sweeps
+/// again.
+async fn sweep_old_files(root: &Path, max_age: Duration) {
+    if max_age.is_zero() {
+        return;
+    }
+    let Ok(mut entries) = tokio::fs::read_dir(root).await else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if now.duration_since(modified).unwrap_or_default() > max_age {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
     }
 }
 
@@ -194,10 +349,7 @@ mod tests {
     fn default_pipeline_config(enabled: bool) -> MediaPipelineConfig {
         MediaPipelineConfig {
             enabled,
-            transcribe_audio: true,
-            describe_images: true,
-            summarize_video: true,
-            announce_documents: true,
+            ..MediaPipelineConfig::default()
         }
     }
 
@@ -418,6 +570,7 @@ mod tests {
             describe_images: false,
             summarize_video: false,
             announce_documents: false,
+            ..MediaPipelineConfig::default()
         };
         let pipeline = MediaPipeline::new(&config, None, false);
 
@@ -443,5 +596,112 @@ mod tests {
             result,
             "[Document: invoice.pdf attached, type application/pdf, 4096 bytes]\n\nplease read it"
         );
+    }
+
+    #[tokio::test]
+    async fn image_lands_as_file_with_path_marker_for_vision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true)
+            .with_files_root(Some(dir.path().to_path_buf()));
+
+        let result = pipeline.process("check this", &[sample_image()]).await;
+
+        assert!(
+            !result.contains("[IMAGE:data:"),
+            "with a files root the annotation must not inline base64, got: {result}"
+        );
+        let marker_path = result
+            .split("[IMAGE:")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("path marker present");
+        assert!(
+            std::path::Path::new(marker_path).is_file(),
+            "marker must point at a real file: {marker_path}"
+        );
+        assert_eq!(std::fs::read(marker_path).unwrap(), sample_image().data);
+        assert!(result.contains("saved at"), "got: {result}");
+        assert!(result.contains("check this"));
+    }
+
+    #[tokio::test]
+    async fn document_lands_as_file_and_annotation_names_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, false)
+            .with_files_root(Some(dir.path().to_path_buf()));
+
+        let result = pipeline.process("", &[sample_document()]).await;
+
+        assert!(result.contains("saved at"), "got: {result}");
+        let saved: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(saved.len(), 1);
+        let name = saved[0].as_ref().unwrap().file_name();
+        assert!(
+            name.to_string_lossy().ends_with("_invoice.pdf"),
+            "unexpected landed name: {name:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unwritable_files_root_falls_back_to_inline() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true)
+            .with_files_root(Some(PathBuf::from("/dev/null/not-a-dir")));
+
+        let result = pipeline.process("check this", &[sample_image()]).await;
+        assert!(
+            result.contains("[IMAGE:data:image/jpeg;base64,"),
+            "fallback must keep the vision flow alive, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_name_attachments_do_not_collide() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, false)
+            .with_files_root(Some(dir.path().to_path_buf()));
+
+        let result = pipeline
+            .process("", &[sample_document(), sample_document()])
+            .await;
+
+        assert_eq!(result.matches("saved at").count(), 2);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_only_stale_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = dir.path().join("old.bin");
+        std::fs::write(&stale, b"x").unwrap();
+        let ago = std::time::SystemTime::now() - Duration::from_secs(10 * 3600);
+        let file = std::fs::File::options().write(true).open(&stale).unwrap();
+        file.set_modified(ago).unwrap();
+        drop(file);
+        let fresh = dir.path().join("new.bin");
+        std::fs::write(&fresh, b"y").unwrap();
+
+        sweep_old_files(dir.path(), Duration::from_secs(3600)).await;
+
+        assert!(!stale.exists(), "stale file must be swept");
+        assert!(fresh.exists(), "fresh file must survive");
+    }
+
+    #[test]
+    fn sanitize_strips_traversal_and_junk() {
+        assert_eq!(sanitize_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_file_name("my photo (1).jpg"), "my_photo__1_.jpg");
+        assert_eq!(sanitize_file_name("..."), "attachment");
+        assert_eq!(sanitize_file_name("c:\\x\\évil né.pdf"), "vil_n_.pdf");
+    }
+
+    #[test]
+    fn image_file_name_tracks_png_normalization() {
+        assert_eq!(image_file_name("sticker.webp", "image/png"), "sticker.png");
+        assert_eq!(image_file_name("photo.jpg", "image/jpeg"), "photo.jpg");
+        assert_eq!(image_file_name("shot.png", "image/png"), "shot.png");
     }
 }

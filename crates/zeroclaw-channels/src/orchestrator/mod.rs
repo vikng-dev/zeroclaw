@@ -4869,11 +4869,22 @@ async fn process_channel_message_body(
                 Some(m)
             }
         };
+        // Attachments land as files (config files_dir, else a workspace
+        // subdir) so annotations carry a path instead of inline base64: the
+        // persisted turn stays small and the agent's file tools can reuse
+        // the bytes.
+        let files_root = ctx
+            .media_pipeline
+            .files_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| Some(ctx.workspace_dir.join("media_files")));
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             transcription_manager.as_ref(),
             vision,
-        );
+        )
+        .with_files_root(files_root);
         msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
     }
 

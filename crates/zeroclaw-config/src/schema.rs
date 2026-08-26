@@ -6469,6 +6469,23 @@ pub struct MediaPipelineConfig {
     /// a file arrived and can ask for or fetch it.
     #[serde(default = "default_true")]
     pub announce_documents: bool,
+
+    /// Directory where inbound media attachments are written so the agent's
+    /// file tools can reuse them (upload, move, read). Unset means
+    /// `<workspace>/media_files`. Point it elsewhere when the workspace is
+    /// mounted read-only; the directory must then also be reachable through
+    /// the filesystem allowlists for the agent to touch the files.
+    #[serde(default)]
+    pub files_dir: Option<String>,
+
+    /// How long saved attachment files are kept, in hours (default 72).
+    /// Old files are swept opportunistically as new media arrives.
+    #[serde(default = "default_media_retention_hours")]
+    pub retention_hours: u64,
+}
+
+fn default_media_retention_hours() -> u64 {
+    72
 }
 
 impl Default for MediaPipelineConfig {
@@ -6479,6 +6496,8 @@ impl Default for MediaPipelineConfig {
             describe_images: true,
             summarize_video: true,
             announce_documents: true,
+            files_dir: None,
+            retention_hours: default_media_retention_hours(),
         }
     }
 }
