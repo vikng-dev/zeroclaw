@@ -902,6 +902,190 @@ mod tests {
         );
     }
 
+    /// One default-target call site per activated crate, spelled as the
+    /// module path `log` derives from `module_path!()` when the call passes
+    /// no `target:`. Each is a real site at pin `cbcdd2a`; the expected root
+    /// is what `TARGET_CRATES` must reduce it to.
+    const ACTIVATED_CRATE_SITES: &[(&str, &str)] = &[
+        ("whatsapp_rust::message", "whatsapp_rust"),
+        ("wacore::send", "wacore"),
+        (
+            "wacore_libsignal::protocol::session_cipher",
+            "wacore_libsignal",
+        ),
+        ("wacore_noise::framing", "wacore_noise"),
+        (
+            "whatsapp_rust_tokio_transport",
+            "whatsapp_rust_tokio_transport",
+        ),
+    ];
+
+    /// Whether the fmt layer rendered a record under exactly this target.
+    /// `tracing_log` puts the bridged target back on the normalized metadata,
+    /// so the fmt line reads `DEBUG <target>: <message>`. Matched as a whole
+    /// token because a `contains` would let the `wacore` directive look
+    /// satisfied by a `wacore_libsignal` record, which is the distinction
+    /// these tests exist to make.
+    fn renders_target(out: &str, target: &str) -> bool {
+        let rendered = format!("{target}:");
+        out.split_whitespace().any(|token| token == rendered)
+    }
+
+    /// Every crate the `whatsapp-web` feature activates that logs without an
+    /// explicit `target:` must arrive at the real sinks under its own
+    /// reviewed root, not under the shared redaction marker.
+    ///
+    /// `module_path` and `file` are dropped at the boundary, so the target is
+    /// the only field left that says which component spoke. A crate missing
+    /// from `TARGET_CRATES` still fails closed — its record crosses as
+    /// `[third-party target redacted]` — but that makes an activated part of
+    /// the WhatsApp protocol stack indistinguishable from an unreviewed
+    /// transitive dependency, which is the opposite of what this bridge is
+    /// for. So the coverage is pinned against the locked graph rather than
+    /// left to the two crates that happened to be read first.
+    #[test]
+    fn every_activated_crate_reaches_the_sinks_under_its_own_root() {
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::LogConfig {
+            log_persistence: "rolling".into(),
+            log_persistence_max_entries: 1000,
+            ..crate::config::LogConfig::default()
+        };
+        crate::writer::init_from_config(&cfg, tmp.path());
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        crate::try_install_capture_subscriber();
+
+        let subscriber = tracing_subscriber::registry().with(LogCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            for (site, _) in ACTIVATED_CRATE_SITES {
+                log::warn!(target: *site, "{TRANSPORT_FAILURE}");
+            }
+        });
+
+        let mut broadcast = Vec::new();
+        while let Ok(value) = rx.try_recv() {
+            broadcast.push(value.to_string());
+        }
+        crate::broadcast::clear_broadcast_hook();
+
+        crate::writer::flush_for_test().unwrap();
+        let persisted =
+            std::fs::read_to_string(crate::writer::runtime_trace_path().unwrap()).unwrap();
+
+        let bridged: Vec<serde_json::Value> = persisted
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["attributes"]["log.target"].is_string())
+            .collect();
+        assert_eq!(
+            bridged.len(),
+            ACTIVATED_CRATE_SITES.len(),
+            "every activated crate's record must be persisted: {persisted}"
+        );
+        assert_eq!(
+            broadcast.len(),
+            ACTIVATED_CRATE_SITES.len(),
+            "every activated crate's record must also be broadcast: {broadcast:?}"
+        );
+
+        for ((site, root), record) in ACTIVATED_CRATE_SITES.iter().zip(&bridged) {
+            assert_eq!(
+                record["attributes"]["log.target"], *root,
+                "`{site}` must arrive under its crate's reviewed root, not the \
+                 redaction marker: {record}"
+            );
+            assert_eq!(
+                record["message"],
+                crate::log_bridge::REDACTED_MESSAGE,
+                "the message body is still withheld for every crate: {record}"
+            );
+            assert!(
+                record["attributes"]["log.module_path"].is_null()
+                    && record["attributes"]["log.file"].is_null(),
+                "the dropped channels stay dropped for every crate: {record}"
+            );
+            assert_eq!(
+                record["severity_text"], "WARN",
+                "severity survives for every crate: {record}"
+            );
+        }
+
+        // The other half of the decision: the packages in the same activated
+        // graph that emit nothing on the default target are absent from the
+        // vocabulary, so a record claiming their root is redacted like any
+        // other unreviewed one.
+        assert_eq!(
+            crate::log_bridge::TARGET_CRATES.len(),
+            ACTIVATED_CRATE_SITES.len(),
+            "the vocabulary and the reviewed call-site list must describe the \
+             same set of crates"
+        );
+    }
+
+    /// The filter contract per crate: a directive naming a crate selects that
+    /// crate's bridged records, and `EnvFilter` matches a directive target as
+    /// a prefix, so the family directives documented on `TARGET_CRATES`
+    /// (`wacore=debug`, `whatsapp_rust=debug`) reach the sibling crates whose
+    /// roots extend them. Pinned per directive rather than described, because
+    /// the reduction happens before the filters look and a missing root would
+    /// silently stop being addressable.
+    #[test]
+    fn each_activated_crate_is_selectable_by_its_own_directive() {
+        crate::try_install_capture_subscriber();
+
+        for (directive, expected) in [
+            (
+                "wacore",
+                &["wacore", "wacore_libsignal", "wacore_noise"][..],
+            ),
+            ("wacore_libsignal", &["wacore_libsignal"][..]),
+            ("wacore_noise", &["wacore_noise"][..]),
+            (
+                "whatsapp_rust",
+                &["whatsapp_rust", "whatsapp_rust_tokio_transport"][..],
+            ),
+            (
+                "whatsapp_rust_tokio_transport",
+                &["whatsapp_rust_tokio_transport"][..],
+            ),
+        ] {
+            let buf = BufMakeWriter::default();
+            let fmt_layer = fmt::layer()
+                .fmt_fields(RedactEphemeralFields)
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .event_format(AgentAliasFormatter::new())
+                .with_filter(EnvFilter::new(format!("{directive}=debug")));
+            let subscriber = tracing_subscriber::registry().with(fmt_layer);
+
+            tracing::subscriber::with_default(subscriber, || {
+                for (site, _) in ACTIVATED_CRATE_SITES {
+                    log::debug!(target: *site, "{TRANSPORT_FAILURE}");
+                }
+            });
+
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            for (_, root) in ACTIVATED_CRATE_SITES {
+                assert_eq!(
+                    renders_target(&out, root),
+                    expected.contains(root),
+                    "`RUST_LOG={directive}=debug` must {} `{root}`: {out:?}",
+                    if expected.contains(root) {
+                        "select"
+                    } else {
+                        "not select"
+                    }
+                );
+            }
+        }
+    }
+
     /// `log_enabled!` must answer with the active tracing filter, the way
     /// `tracing_log::LogTracer` does. The bridge sets `log`'s own max level to
     /// `Trace`, so an unconditional `enabled` makes every guarded diagnostic

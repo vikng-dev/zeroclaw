@@ -55,12 +55,14 @@
 //!   `usync`; the pin contains no computed target expression). An incoming
 //!   target crosses only on an exact match, and what crosses is the table's
 //!   own constant.
-//! - [`TARGET_CRATES`]: the crates in the pinned tree that log through the
-//!   facade *without* an explicit `target:`, so their records arrive with
-//!   the module path as the target. Only the crate's reviewed name crosses:
-//!   everything after `::` in a module path is still a runtime string that a
-//!   hand-built record can abuse (`whatsapp_rust::<jid>` is charset-clean),
-//!   so `whatsapp_rust::socket` is reduced to `whatsapp_rust`.
+//! - [`TARGET_CRATES`]: the crates the `whatsapp-web` feature activates that
+//!   log through the facade *without* an explicit `target:`, so their records
+//!   arrive with the module path as the target. Only the crate's reviewed
+//!   name crosses: everything after `::` in a module path is still a runtime
+//!   string that a hand-built record can abuse (`whatsapp_rust::<jid>` is
+//!   charset-clean), so `whatsapp_rust::socket` is reduced to
+//!   `whatsapp_rust`. The table's own doc comment carries the per-crate
+//!   decision for the whole activated graph.
 //!
 //! Anything else is replaced *whole* by [`REDACTED_TARGET`] — never
 //! truncated and never rewritten character by character, because a partial
@@ -101,12 +103,13 @@ pub(crate) const REDACTED_MESSAGE: &str = "[third-party message redacted]";
 /// over it.
 pub(crate) const REDACTED_TARGET: &str = "[third-party target redacted]";
 
-/// The hand-written `target: "..."` literals in the pinned `whatsapp-rust`
-/// revision (`cbcdd2a6`), read off its sources whole — the pin has no
-/// computed target expression. Byte-sorted for the binary search; a test
-/// pins the ordering. An entry here is a claim that this exact string was
-/// seen in the reviewed dependency source, so the table only grows by
-/// re-reading a pin.
+/// The hand-written `target: "..."` literals across the whole activated
+/// `whatsapp-web` graph at pin `cbcdd2a6`, read off its sources whole — the
+/// pin has no computed target expression (`src/handlers/macros.rs` takes
+/// `target: $target:literal`, so its expansions are literals too).
+/// Byte-sorted for the binary search; a test pins the ordering. An entry here
+/// is a claim that this exact string was seen in the reviewed dependency
+/// source, so the table only grows by re-reading a pin.
 pub(crate) const TARGET_LITERALS: &[&str] = &[
     "AppState",
     "Blocking",
@@ -148,11 +151,46 @@ pub(crate) const TARGET_LITERALS: &[&str] = &[
     "usync",
 ];
 
-/// The crates in the pinned tree that log through the facade without an
-/// explicit `target:`, so their records carry the module path as the
-/// target. A module-path target is reduced to its crate's reviewed name;
-/// the segments after `::` are runtime strings and never cross.
-pub(crate) const TARGET_CRATES: &[&str] = &["wacore", "whatsapp_rust"];
+/// The crates the `whatsapp-web` feature activates that log through the
+/// facade without an explicit `target:`, so their records carry the module
+/// path as the target. A module-path target is reduced to its crate's
+/// reviewed name; the segments after `::` are runtime strings and never
+/// cross.
+///
+/// Every package in the locked `whatsapp-web` graph at pin `cbcdd2a6`, and
+/// the decision made for it. "Default-target calls" counts `log` macro calls
+/// with no `target:`; their target is the module path, whose root is the
+/// crate's lib name.
+///
+/// | activated package | default-target calls | decision |
+/// |---|---:|---|
+/// | `whatsapp-rust` | 540 | **preserve** as `whatsapp_rust` — client, message and socket diagnostics; the crate this bridge exists to recover |
+/// | `wacore` | 38 | **preserve** as `wacore` — send path, prekey fetch, device persistence |
+/// | `wacore-libsignal` | 35 | **preserve** as `wacore_libsignal` — session and MAC failures; the ones worth reading when decryption breaks |
+/// | `whatsapp-rust-tokio-transport` | 8 | **preserve** as `whatsapp_rust_tokio_transport` — websocket dial and read failures |
+/// | `wacore-noise` | 2 | **preserve** as `wacore_noise` — frame decode; two `trace!`s, but the same rule as its siblings costs nothing |
+/// | `wacore-appstate` | 0 | nothing to decide — all 8 of its calls pass `target: "AppState"`, already in [`TARGET_LITERALS`] |
+/// | `wacore-binary`, `waproto`, `whatsapp-rust-ureq-http-client`, `wacore-derive` | 0 | nothing to decide — none depends on `log` |
+///
+/// Preserving each root rather than folding them into one family keeps the
+/// answer to "which component spoke" in the only field that survives the
+/// boundary, since `module_path` and `file` are dropped. `EnvFilter` matches
+/// a directive's target as a prefix, so `RUST_LOG=whatsapp_rust=debug` picks
+/// up `whatsapp_rust_tokio_transport` too and `wacore=debug` picks up
+/// `wacore_libsignal` and `wacore_noise`; a directive naming the crate
+/// exactly selects just that crate. A test pins both.
+///
+/// A crate outside this table crosses as [`REDACTED_TARGET`] with its
+/// severity and line intact — still more than `master` gives, which is
+/// nothing — and widening the table is a one-line change reviewed against a
+/// named pin.
+pub(crate) const TARGET_CRATES: &[&str] = &[
+    "wacore",
+    "wacore_libsignal",
+    "wacore_noise",
+    "whatsapp_rust",
+    "whatsapp_rust_tokio_transport",
+];
 
 /// The target as it is allowed to cross: a constant from the reviewed
 /// tables, or [`REDACTED_TARGET`]. Never a borrow of the record's own
@@ -330,6 +368,81 @@ mod tests {
         // Which is also what defuses a payload smuggled behind a real crate
         // name — charset-clean, and it still cannot cross.
         assert_eq!(safe_target("whatsapp_rust::9725012345678"), "whatsapp_rust");
+    }
+
+    /// The activated `whatsapp-web` graph at pin `cbcdd2a6` has exactly five
+    /// crates that log without an explicit `target:`, and each one is a
+    /// deliberate `preserve` in the table above. Pinned as a set so a crate
+    /// cannot be dropped from the vocabulary — which fails closed, but
+    /// closed means a reviewed component goes anonymous — and so a root
+    /// cannot be added without re-reading a pin.
+    #[test]
+    fn every_activated_default_target_crate_crosses_as_its_own_root() {
+        assert_eq!(
+            TARGET_CRATES,
+            [
+                "wacore",
+                "wacore_libsignal",
+                "wacore_noise",
+                "whatsapp_rust",
+                "whatsapp_rust_tokio_transport",
+            ],
+            "the reviewed vocabulary must be the activated graph's \
+             default-target crates, no more and no less"
+        );
+        // A bare root, and the module path a default-target call actually
+        // produces at each of the sites read off the pin.
+        for (emitted, module_path) in [
+            ("whatsapp_rust", "whatsapp_rust::message"),
+            ("wacore", "wacore::send"),
+            ("wacore_libsignal", "wacore_libsignal::protocol::session"),
+            ("wacore_noise", "wacore_noise::framing"),
+            (
+                "whatsapp_rust_tokio_transport",
+                "whatsapp_rust_tokio_transport::lib",
+            ),
+        ] {
+            assert_eq!(
+                safe_target(emitted),
+                emitted,
+                "an activated crate's own root must cross"
+            );
+            assert_eq!(
+                safe_target(module_path),
+                emitted,
+                "a module path must reduce to its crate's reviewed name"
+            );
+            // And the same reduction defuses a payload smuggled behind that
+            // crate's name, for every root in the table rather than one.
+            assert_eq!(
+                safe_target(&format!("{emitted}::972501234567")),
+                emitted,
+                "a runtime segment behind a reviewed root must not cross"
+            );
+        }
+        // The rest of the activated graph emits nothing on the default
+        // target, so its roots are absent by decision, not by oversight:
+        // `wacore_appstate` logs only through `target: "AppState"`, and the
+        // other four do not depend on `log` at all.
+        for absent in [
+            "wacore_appstate",
+            "wacore_binary",
+            "wacore_derive",
+            "waproto",
+            "whatsapp_rust_ureq_http_client",
+        ] {
+            assert_eq!(
+                safe_target(absent),
+                REDACTED_TARGET,
+                "a package with no default-target call must not be in the \
+                 vocabulary: {absent}"
+            );
+        }
+        assert_eq!(
+            safe_target("AppState"),
+            "AppState",
+            "`wacore-appstate`'s records cross by their literal instead"
+        );
     }
 
     /// Everything outside the reviewed tables is replaced whole — no
