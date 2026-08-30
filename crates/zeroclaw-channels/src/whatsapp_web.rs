@@ -3109,8 +3109,8 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn media_ref_descriptors_cover_primary_quoted_document_and_skip_view_once() {
-        fn image_msg() -> waproto::whatsapp::ImageMessage {
-            waproto::whatsapp::ImageMessage {
+        fn image_msg() -> waproto::whatsapp::message::ImageMessage {
+            waproto::whatsapp::message::ImageMessage {
                 direct_path: Some("/v/x".into()),
                 media_key: Some(vec![1]),
                 file_enc_sha256: Some(vec![2]),
@@ -3128,21 +3128,23 @@ mod tests {
 
         // A reply whose quoted message carries the image: quoted ticket minted.
         let quoting = waproto::whatsapp::Message {
-            extended_text_message: Some(Box::new(waproto::whatsapp::ExtendedTextMessage {
-                text: Some("save it".into()),
-                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
-                    quoted_message: Some(Box::new(msg.clone())),
+            extended_text_message: Some(Box::new(
+                waproto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("save it".into()),
+                    context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                        quoted_message: Some(Box::new(msg.clone())),
+                        ..Default::default()
+                    })),
                     ..Default::default()
-                })),
-                ..Default::default()
-            })),
+                },
+            )),
             ..Default::default()
         };
         assert_eq!(WhatsAppWebChannel::media_ref_descriptors(&quoting).len(), 1);
 
         // Documents are redeemable too.
         let doc = waproto::whatsapp::Message {
-            document_message: Some(Box::new(waproto::whatsapp::DocumentMessage {
+            document_message: Some(Box::new(waproto::whatsapp::message::DocumentMessage {
                 direct_path: Some("/v/d".into()),
                 media_key: Some(vec![1]),
                 file_enc_sha256: Some(vec![2]),
@@ -3162,7 +3164,7 @@ mod tests {
 
         // View-once media never becomes a durable, replayable claim.
         let view_once = waproto::whatsapp::Message {
-            image_message: Some(Box::new(waproto::whatsapp::ImageMessage {
+            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
                 view_once: Some(true),
                 ..image_msg()
             })),
