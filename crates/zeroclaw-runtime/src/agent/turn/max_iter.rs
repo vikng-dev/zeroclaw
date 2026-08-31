@@ -7,8 +7,18 @@ use super::outcome::ToolLoopCancelled;
 use anyhow::Result;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+/// The iteration-cap stop, shared by the `ErrorAtCap` exit and the
+/// graceful-summary failure paths so all three carry one code and one message.
+fn max_iterations_stop(max_iterations: usize) -> TurnStop {
+    TurnStop::close_out(
+        TurnStopCode::MaxIterations,
+        format!("Agent exceeded maximum tool iterations ({max_iterations})"),
+    )
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
@@ -41,7 +51,7 @@ pub(crate) async fn finish_after_max_iterations(
     // ErrorAtCap callers (embedders driving Agent::turn) treat the cap as a
     // control signal: bail instead of spending another LLM call on a summary.
     if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        return Err(max_iterations_stop(max_iterations).into());
     }
 
     // Graceful shutdown: ask the LLM for a final summary without tools
@@ -143,7 +153,11 @@ pub(crate) async fn finish_after_max_iterations(
         }
         SummaryCall::TimedOut(step_secs) => {
             history.pop();
-            anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
+            return Err(TurnStop::close_out(
+                TurnStopCode::MaxIterations,
+                format!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"),
+            )
+            .into());
         }
         SummaryCall::Done(Err(e)) => {
             ::zeroclaw_log::record!(
@@ -161,7 +175,7 @@ pub(crate) async fn finish_after_max_iterations(
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             history.pop();
-            anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+            return Err(max_iterations_stop(max_iterations).into());
         }
         SummaryCall::Done(Ok(resp)) => resp,
     };
@@ -169,7 +183,7 @@ pub(crate) async fn finish_after_max_iterations(
     let text = resp.text.unwrap_or_default();
     if text.is_empty() {
         history.pop();
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        return Err(max_iterations_stop(max_iterations).into());
     }
     let summary_msg = ChatMessage::assistant(text.clone());
     if let Some(out) = &mut new_messages_out {
@@ -456,6 +470,29 @@ mod i18n_message_tests {
         assert!(
             msg.contains("maximum tool iterations"),
             "message should describe the limit: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_api::turn_stop::turn_stop;
+
+    #[test]
+    fn the_iteration_cap_stop_is_typed_and_says_what_it_always_said() {
+        let stop = max_iterations_stop(10);
+        assert_eq!(stop.code, TurnStopCode::MaxIterations);
+        assert_eq!(
+            stop.to_string(),
+            "Agent exceeded maximum tool iterations (10)"
+        );
+        let err: anyhow::Error = stop.into();
+        assert_eq!(
+            turn_stop(&err)
+                .expect("stop must survive the anyhow hop")
+                .code,
+            TurnStopCode::MaxIterations
         );
     }
 }

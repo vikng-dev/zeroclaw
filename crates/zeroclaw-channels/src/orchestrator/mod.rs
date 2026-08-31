@@ -2401,22 +2401,6 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     zeroclaw_providers::reliable::is_non_retryable(error)
 }
 
-fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    [
-        "exceeds the context window",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-    ]
-    .iter()
-    .any(|hint| lower.contains(hint))
-}
-
 fn load_cached_model_preview(
     data_dir: &Path,
     agent_workspace_dir: &Path,
@@ -6298,7 +6282,7 @@ async fn process_channel_message_body(
                         &format!("Failed to cancel draft on {}", channel.name())
                     );
                 }
-            } else if is_context_window_overflow_error(&e) {
+            } else if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
                     "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
@@ -12969,11 +12953,15 @@ temperature = 0.3
         let overflow_err = anyhow::Error::msg(
             "OpenAI Codex stream error: Your input exceeds the context window of this model.",
         );
-        assert!(is_context_window_overflow_error(&overflow_err));
+        assert!(zeroclaw_providers::reliable::is_context_window_exceeded(
+            &overflow_err
+        ));
 
         let other_err =
             anyhow::Error::msg("OpenAI Codex API error (502 Bad Gateway): error code: 502");
-        assert!(!is_context_window_overflow_error(&other_err));
+        assert!(!zeroclaw_providers::reliable::is_context_window_exceeded(
+            &other_err
+        ));
     }
 
     fn channel_runtime_context_for_defaults_test(

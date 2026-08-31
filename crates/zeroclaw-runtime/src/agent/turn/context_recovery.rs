@@ -54,6 +54,23 @@ pub(crate) fn record_llm_failure(
     );
 }
 
+/// What the in-loop context-overflow recovery attempt concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextRecovery {
+    /// The failure was not a context-window overflow.
+    NotOverflow,
+    /// History was trimmed; the provider call is worth retrying.
+    Recovered,
+    /// It was an overflow and there is nothing left to trim.
+    Unrecoverable,
+}
+
+impl ContextRecovery {
+    pub(crate) fn recovered(self) -> bool {
+        self == Self::Recovered
+    }
+}
+
 pub(crate) async fn try_recover_context_overflow(
     history: &mut Vec<ChatMessage>,
     e: &anyhow::Error,
@@ -61,7 +78,7 @@ pub(crate) async fn try_recover_context_overflow(
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     observer: &dyn Observer,
     context_token_budget: usize,
-) -> bool {
+) -> ContextRecovery {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
             WARN,
@@ -127,7 +144,7 @@ pub(crate) async fn try_recover_context_overflow(
                 agent_alias: None,
                 turn_id: None,
             });
-            return true;
+            return ContextRecovery::Recovered;
         }
 
         let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
@@ -156,8 +173,9 @@ pub(crate) async fn try_recover_context_overflow(
                 "Context overflow unrecoverable: only one turn left, cannot trim further"
             );
         }
+        return ContextRecovery::Unrecoverable;
     }
-    false
+    ContextRecovery::NotOverflow
 }
 
 #[cfg(test)]
@@ -186,7 +204,11 @@ mod tests {
         let recovered =
             try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
 
-        assert!(recovered, "an overflowing history must trim and recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Recovered,
+            "an overflowing history must trim and recover"
+        );
         // The retried history must carry the model-visible breadcrumb after the
         // leading system messages, matching the turn-boundary contract.
         let breadcrumb_text = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
@@ -231,8 +253,9 @@ mod tests {
         let recovered =
             try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 100).await;
 
-        assert!(
-            !recovered,
+        assert_eq!(
+            recovered,
+            ContextRecovery::Unrecoverable,
             "single-turn floor overflow must not retry (no #5808 loop)"
         );
         assert!(
@@ -258,7 +281,11 @@ mod tests {
         let recovered =
             try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
 
-        assert!(!recovered, "a non-overflow error must not trigger recovery");
+        assert_eq!(
+            recovered,
+            ContextRecovery::NotOverflow,
+            "a non-overflow error must not trigger recovery"
+        );
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
     }
 
@@ -289,7 +316,11 @@ mod tests {
 
         let recovered =
             try_recover_context_overflow(&mut history, &err, 1, None, &observer, budget).await;
-        assert!(!recovered, "floor-dominates overflow must not recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Unrecoverable,
+            "floor-dominates overflow must not recover"
+        );
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s
         // deadline, tolerating `Lagged` from parallel broadcast traffic.
