@@ -185,6 +185,9 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
     let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
 
     if policy.storage.is_enabled() {
+        // The previous worker is stopped and the next one has not started, so
+        // any trim temp still on disk was stranded by a crash or kill.
+        sweep_stranded_trim_temps(&policy.path);
         let worker_state = Arc::new(WorkerState {
             policy: policy.clone(),
             worker_dead: Arc::clone(&worker_dead),
@@ -640,11 +643,12 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
     }
     let skip = total - state.policy.max_entries;
 
-    let tmp = state.policy.path.with_extension(format!(
-        "tmp.{}.{}",
+    let tmp = TrimTemp::new(state.policy.path.with_extension(format!(
+        "{TRIM_TEMP_TAG}.{}.{}",
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-    ));
+    )));
+    let tmp_path = tmp.path().to_path_buf();
 
     {
         let mut opts = OpenOptions::new();
@@ -655,8 +659,8 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
             opts.mode(0o600);
         }
         let out_file = opts
-            .open(&tmp)
-            .with_context(|| format!("creating trim temp file {}", tmp.display()))?;
+            .open(&tmp_path)
+            .with_context(|| format!("creating trim temp file {}", tmp_path.display()))?;
         let mut out = BufWriter::new(out_file);
 
         let in_file = fs::File::open(&state.policy.path)
@@ -686,17 +690,127 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
     }
-    fs::rename(&tmp, &state.policy.path).with_context(|| {
+    fs::rename(&tmp_path, &state.policy.path).with_context(|| {
         format!(
             "renaming trim temp {} → {}",
-            tmp.display(),
+            tmp_path.display(),
             state.policy.path.display()
         )
     })?;
+    tmp.commit();
 
     Ok(())
+}
+
+/// Filename tag every trim temp carries: `<base>.tmp.<pid>.<nanos>`.
+const TRIM_TEMP_TAG: &str = "tmp";
+
+/// Owns a trim temp file for the duration of a rotation and deletes it unless
+/// the rotation commits. Without this every failed trim strands a full-size
+/// copy of the log that nothing ever reclaims — retention only classifies
+/// timestamped archives, so the temps accumulate until the volume fills and
+/// every subsequent write (append included) fails.
+struct TrimTemp {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TrimTemp {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TrimTemp {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                target: "zeroclaw_log_internal",
+                error = ?err,
+                path = %self.path.display(),
+                "log: removing abandoned trim temp failed",
+            ),
+        }
+    }
+}
+
+/// Delete trim temps left by a previous process. A kill mid-rotation (deploy,
+/// OOM) strands one every time, and the writer rotates on every append once the
+/// file is at its cap, so restarts alone accumulate them.
+///
+/// Deleting rather than adopting: a stranded temp is a partial copy of lines the
+/// active file still holds, so nothing is lost by removing it, whereas adopting
+/// one would truncate the log to an unknown prefix.
+fn sweep_stranded_trim_temps(active: &Path) {
+    let dir = active.parent().unwrap_or_else(|| Path::new("."));
+    let Some(active_name) = active.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let prefix = format!("{}.{TRIM_TEMP_TAG}.", split_base_ext(active_name).0);
+
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!(
+                target: "zeroclaw_log_internal",
+                error = ?err,
+                dir = %dir.display(),
+                "log: listing trim temps for cleanup failed",
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !is_trim_temp_suffix(suffix) {
+            continue;
+        }
+        if !entry.metadata().is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        if let Err(err) = fs::remove_file(entry.path()) {
+            tracing::warn!(
+                target: "zeroclaw_log_internal",
+                error = ?err,
+                path = %entry.path().display(),
+                "log: removing stranded trim temp failed",
+            );
+        }
+    }
+}
+
+/// True for the `<pid>.<nanos>` tail of a trim temp: two non-empty all-digit
+/// parts, so an operator's own `runtime-trace.tmp.keep` is never swept.
+fn is_trim_temp_suffix(suffix: &str) -> bool {
+    let Some((pid, nanos)) = suffix.split_once('.') else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(pid) && digits(nanos)
 }
 
 fn count_nonempty_lines(path: &Path) -> Result<usize> {
@@ -1926,5 +2040,208 @@ mod tests {
         );
         // Real archives are still pruned to the cap.
         assert_eq!(archives.len(), 1, "real archives are still capped");
+    }
+
+    /// Every `<base>.tmp.<pid>.<nanos>` sibling of the active file.
+    fn trim_temps(active: &Path) -> Vec<PathBuf> {
+        let dir = active.parent().unwrap();
+        let prefix = format!(
+            "{}.{TRIM_TEMP_TAG}.",
+            split_base_ext(active.file_name().unwrap().to_str().unwrap()).0
+        );
+        let mut out: Vec<PathBuf> = fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .and_then(|n| n.strip_prefix(&prefix).map(is_trim_temp_suffix))
+                            .unwrap_or(false)
+                    })
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// The production wedge: a kill mid-rotation strands a trim temp, and
+    /// nothing ever reclaims it — retention only classifies timestamped
+    /// archives — so restarts pile them up until the volume fills and every
+    /// write, append included, fails. Startup must reclaim them.
+    #[test]
+    fn stranded_trim_temps_from_an_interrupted_rotation_are_reclaimed() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+
+        // Exactly the shape observed on a wedged pod (PID 1 in a container).
+        let stranded: Vec<PathBuf> = [
+            "runtime-trace.tmp.1.1756000000000000000",
+            "runtime-trace.tmp.1.1756000000000000001",
+        ]
+        .iter()
+        .map(|n| state_dir.join(n))
+        .collect();
+        for p in &stranded {
+            fs::write(p, "{\"message\":\"half-copied\"}\n").unwrap();
+        }
+
+        install_writer(tmp.path(), 3);
+        let path = runtime_trace_path().unwrap();
+        assert_eq!(path.parent().unwrap(), state_dir);
+
+        for i in 0..8 {
+            emit(&format!("after-restart-{i}"));
+        }
+        flush_for_test().unwrap();
+
+        assert!(
+            trim_temps(&path).is_empty(),
+            "stranded trim temps must not survive: {:?}",
+            trim_temps(&path)
+        );
+        // The log itself is untouched by the sweep and still trims to the cap.
+        assert_eq!(count_lines(&path), 3);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("after-restart-7")
+        );
+    }
+
+    /// A completed rotation leaves nothing behind, and a run that never
+    /// reaches the cap never creates a temp at all.
+    #[test]
+    fn rolling_trim_leaves_no_temp_file_behind() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 5);
+        let path = runtime_trace_path().unwrap();
+
+        // Under the cap: no rotation, no temp.
+        for i in 0..4 {
+            emit(&format!("under-{i}"));
+        }
+        flush_for_test().unwrap();
+        assert_eq!(count_lines(&path), 4);
+        assert!(trim_temps(&path).is_empty(), "no temp before the cap");
+
+        // Past the cap: rotation runs on every append and still leaves none.
+        for i in 0..20 {
+            emit(&format!("over-{i}"));
+        }
+        flush_for_test().unwrap();
+        assert_eq!(count_lines(&path), 5);
+        assert!(
+            trim_temps(&path).is_empty(),
+            "a committed rotation leaves no temp: {:?}",
+            trim_temps(&path)
+        );
+    }
+
+    /// A rotation that never commits deletes its own temp; a committed one
+    /// keeps the file it renamed into place.
+    #[test]
+    fn abandoned_trim_temp_is_removed_and_committed_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let abandoned = dir.path().join("runtime-trace.tmp.1.7");
+        fs::write(&abandoned, "partial\n").unwrap();
+        drop(TrimTemp::new(abandoned.clone()));
+        assert!(!abandoned.exists(), "an uncommitted rotation cleans up");
+
+        let committed = dir.path().join("runtime-trace.tmp.1.8");
+        fs::write(&committed, "renamed\n").unwrap();
+        TrimTemp::new(committed.clone()).commit();
+        assert!(committed.exists(), "a committed rotation keeps its result");
+
+        // A temp whose creation failed is not an error to clean up.
+        drop(TrimTemp::new(dir.path().join("runtime-trace.tmp.1.9")));
+    }
+
+    /// Rotation is housekeeping: when it fails the append that preceded it
+    /// still stands and later events keep landing.
+    #[test]
+    fn a_failed_rotation_does_not_stop_future_writes() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 3);
+        let path = runtime_trace_path().unwrap();
+
+        for i in 0..6 {
+            emit(&format!("before-{i}"));
+        }
+        flush_for_test().unwrap();
+        assert_eq!(count_lines(&path), 3);
+
+        // Invalid UTF-8 makes every subsequent trim fail on its line scan.
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0xff, 0xfe, b'\n'])
+            .unwrap();
+
+        for i in 0..5 {
+            emit(&format!("after-{i}"));
+        }
+        flush_for_test().unwrap();
+
+        let body = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+        assert!(
+            body.contains("after-4"),
+            "writes must continue after a failed rotation: {body}"
+        );
+        assert!(
+            trim_temps(&path).is_empty(),
+            "a failed rotation leaves no temp: {:?}",
+            trim_temps(&path)
+        );
+    }
+
+    #[test]
+    fn trim_temp_suffix_matches_only_pid_and_nanos() {
+        assert!(is_trim_temp_suffix("1.1756000000000000000"));
+        assert!(is_trim_temp_suffix("4242.0"));
+        assert!(!is_trim_temp_suffix("keep"));
+        assert!(!is_trim_temp_suffix("1"));
+        assert!(!is_trim_temp_suffix("1."));
+        assert!(!is_trim_temp_suffix(".1"));
+        assert!(!is_trim_temp_suffix("1.2.3"));
+        assert!(!is_trim_temp_suffix("pid.1"));
+    }
+
+    /// The sweep is scoped to the writer's own temps: an operator's sibling
+    /// files and the active log survive it.
+    #[test]
+    fn sweep_spares_foreign_siblings_and_the_active_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("runtime-trace.jsonl");
+        fs::write(&active, "{\"message\":\"live\"}\n").unwrap();
+
+        let keep = [
+            "runtime-trace.tmp.keep",
+            "runtime-trace.tmp.1.2.3",
+            "runtime-trace.20260101-000000.jsonl",
+            "other-trace.tmp.1.5",
+        ]
+        .map(|n| dir.path().join(n));
+        for p in &keep {
+            fs::write(p, "keep\n").unwrap();
+        }
+        let sweepable = dir.path().join("runtime-trace.tmp.1.5");
+        fs::write(&sweepable, "sweep\n").unwrap();
+
+        sweep_stranded_trim_temps(&active);
+
+        assert!(!sweepable.exists(), "the writer's own temp is swept");
+        assert!(active.exists(), "the active log is never swept");
+        for p in &keep {
+            assert!(p.exists(), "foreign sibling swept: {}", p.display());
+        }
     }
 }
