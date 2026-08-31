@@ -1704,6 +1704,10 @@ async fn load_runtime_config_and_defaults(
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
+    // Hot reload must fold in the same `include` fragments the boot load did,
+    // or a reload silently drops every value the shared layer supplied.
+    let contents = zeroclaw_config::include::expand(&contents, path)
+        .with_context(|| format!("Failed to expand includes in {}", path.display()))?;
     let mut parsed: Config = zeroclaw_config::migration::migrate_to_current(&contents)
         .with_context(|| format!("Failed to migrate {}", path.display()))?;
     parsed.config_path = path.to_path_buf();

@@ -18853,6 +18853,13 @@ impl Config {
             && matches!(
                 std::fs::read_to_string(&config_toml_path)
                     .ok()
+                    // `schema_version` may live in an included fragment; a
+                    // failed expansion falls back to the raw file so this
+                    // probe stays non-fatal.
+                    .map(|raw| match crate::include::expand(&raw, &config_toml_path) {
+                        Ok(expanded) => expanded,
+                        Err(_) => raw,
+                    })
                     .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
                     .and_then(|v| crate::migration::detect_version(&v).ok()),
                 Some(v) if v < crate::migration::CURRENT_SCHEMA_VERSION
@@ -18958,6 +18965,11 @@ impl Config {
             let contents = fs::read_to_string(&config_path)
                 .await
                 .context("Failed to read config file")?;
+
+            // Fold in any `include = [...]` fragments before anything reads
+            // the TOML. Returns `contents` verbatim when the key is absent;
+            // fails closed when a declared fragment cannot be merged.
+            let contents = crate::include::expand(&contents, &config_path)?;
 
             // Deserialize the config with the standard TOML parser.
             //
