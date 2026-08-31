@@ -6012,6 +6012,19 @@ pub struct PacingConfig {
     /// caps at Block — it never terminates the turn. Defaults to 5.
     #[serde(default = "default_loop_detection_no_progress_min_calls")]
     pub loop_detection_no_progress_min_calls: usize,
+
+    /// Enable the no-progress pattern (same tool, differing arguments,
+    /// byte-identical results). When `false` that pattern is skipped
+    /// entirely — no warnings and no blocks from it. Defaults to `true`.
+    #[serde(default = "default_loop_detection_no_progress_enabled")]
+    pub loop_detection_no_progress_enabled: bool,
+
+    /// Allow the detector to terminate the turn (`Break`). When `false`
+    /// every pattern caps at Block: exact-repeat and ping-pong keep their
+    /// Warning and Block thresholds but never tear the turn down, leaving
+    /// `max_tool_iterations` as the only stop. Defaults to `true`.
+    #[serde(default = "default_loop_detection_break_enabled")]
+    pub loop_detection_break_enabled: bool,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -6030,6 +6043,14 @@ fn default_loop_detection_no_progress_min_calls() -> usize {
     5
 }
 
+fn default_loop_detection_no_progress_enabled() -> bool {
+    true
+}
+
+fn default_loop_detection_break_enabled() -> bool {
+    true
+}
+
 impl Default for PacingConfig {
     fn default() -> Self {
         Self {
@@ -6041,6 +6062,8 @@ impl Default for PacingConfig {
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
             loop_detection_no_progress_min_calls: default_loop_detection_no_progress_min_calls(),
+            loop_detection_no_progress_enabled: default_loop_detection_no_progress_enabled(),
+            loop_detection_break_enabled: default_loop_detection_break_enabled(),
         }
     }
 }
@@ -32738,12 +32761,28 @@ url = "http://localhost:8080/mcp"
             from_toml.loop_detection_no_progress_min_calls,
             manual.loop_detection_no_progress_min_calls
         );
+        assert_eq!(
+            from_toml.loop_detection_no_progress_enabled,
+            manual.loop_detection_no_progress_enabled
+        );
+        assert_eq!(
+            from_toml.loop_detection_break_enabled,
+            manual.loop_detection_break_enabled
+        );
 
         // Verify concrete values so a silent change to the defaults is caught.
         assert!(from_toml.loop_detection_enabled, "default should be true");
         assert_eq!(from_toml.loop_detection_window_size, 20);
         assert_eq!(from_toml.loop_detection_max_repeats, 3);
         assert_eq!(from_toml.loop_detection_no_progress_min_calls, 5);
+        assert!(
+            from_toml.loop_detection_no_progress_enabled,
+            "default should be true"
+        );
+        assert!(
+            from_toml.loop_detection_break_enabled,
+            "default should be true"
+        );
     }
 
     // ── Docker baked config template ────────────────────────────

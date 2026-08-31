@@ -18,6 +18,11 @@ pub struct LoopDetectorConfig {
     pub max_repeats: usize,
     /// How many same-tool/same-result calls before no-progress escalation starts.
     pub no_progress_min_calls: usize,
+    /// When `false`, the no-progress pattern is not evaluated at all.
+    pub no_progress_enabled: bool,
+    /// When `false`, no pattern escalates past `Block` — the turn is never
+    /// torn down by the detector.
+    pub break_enabled: bool,
 }
 
 impl Default for LoopDetectorConfig {
@@ -27,6 +32,8 @@ impl Default for LoopDetectorConfig {
             window_size: 20,
             max_repeats: 3,
             no_progress_min_calls: 5,
+            no_progress_enabled: true,
+            break_enabled: true,
         }
     }
 }
@@ -141,7 +148,9 @@ impl LoopDetector {
         if let Some(result) = self.detect_ping_pong() {
             return result;
         }
-        if let Some(result) = self.detect_no_progress() {
+        if self.config.no_progress_enabled
+            && let Some(result) = self.detect_no_progress()
+        {
             return result;
         }
 
@@ -162,7 +171,7 @@ impl LoopDetector {
             .take_while(|r| r.name == last.name && r.args_hash == last.args_hash)
             .count();
 
-        if consecutive >= max + 2 {
+        if consecutive >= max + 2 && self.config.break_enabled {
             Some(LoopDetectionResult::Break(format!(
                 "Circuit breaker: tool '{}' called {} times consecutively with identical arguments",
                 last.name, consecutive
@@ -228,7 +237,7 @@ impl LoopDetector {
             }
         }
 
-        if cycles >= MIN_CYCLES + 2 {
+        if cycles >= MIN_CYCLES + 2 && self.config.break_enabled {
             Some(LoopDetectionResult::Break(format!(
                 "Circuit breaker: tools '{}' and '{}' have been alternating for {} cycles",
                 a_name, b_name, cycles
@@ -620,6 +629,142 @@ mod tests {
             }
             other => panic!("expected exact-repeat Warning, got {other:?}"),
         }
+    }
+
+    // ── Per-pattern knob tests ───────────────────────────────────
+
+    #[test]
+    fn no_progress_disabled_never_fires() {
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            no_progress_enabled: false,
+            window_size: 40,
+            ..Default::default()
+        });
+
+        // Same tool, different args, byte-identical results: the no-progress
+        // shape. With the pattern off, nothing at any count.
+        for i in 0..20 {
+            let args = json!({"id": format!("member_{i}")});
+            assert_eq!(
+                det.record("search", &args, "[]"),
+                LoopDetectionResult::Ok,
+                "call {i} must stay Ok with no-progress disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn no_progress_disabled_leaves_other_patterns_alone() {
+        // Turning the pattern off must not disarm exact-repeat.
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            no_progress_enabled: false,
+            ..config_with_repeats(3)
+        });
+        let args = json!({"q": "same"});
+
+        for _ in 0..4 {
+            det.record("search", &args, "no results");
+        }
+        match det.record("search", &args, "no results") {
+            LoopDetectionResult::Break(msg) => assert!(msg.contains("Circuit breaker"), "{msg}"),
+            other => panic!("expected exact-repeat Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_disabled_caps_exact_repeat_at_block() {
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            break_enabled: false,
+            ..config_with_repeats(3)
+        });
+        let args = json!({"cmd": "ls"});
+
+        let mut saw_block = false;
+        for i in 0..12 {
+            let r = det.record("shell", &args, "output");
+            assert!(
+                !matches!(r, LoopDetectionResult::Break(_)),
+                "call {i} must not Break with break disabled (got {r:?})"
+            );
+            if matches!(r, LoopDetectionResult::Block(_)) {
+                saw_block = true;
+            }
+        }
+        assert!(saw_block, "escalation must still reach Block");
+
+        match det.record("shell", &args, "output") {
+            LoopDetectionResult::Block(msg) => assert!(msg.contains("shell"), "{msg}"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_disabled_caps_ping_pong_at_block() {
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            break_enabled: false,
+            ..Default::default()
+        });
+        let args = json!({});
+
+        for i in 0..14 {
+            let name = if i % 2 == 0 { "fetch" } else { "parse" };
+            let r = det.record(name, &args, &format!("r{i}"));
+            assert!(
+                !matches!(r, LoopDetectionResult::Break(_)),
+                "call {i} must not Break with break disabled (got {r:?})"
+            );
+        }
+        match det.record("fetch", &args, "r14") {
+            LoopDetectionResult::Block(msg) => assert!(msg.contains("alternating"), "{msg}"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_disabled_leaves_warning_and_block_thresholds_unchanged() {
+        let mut capped = LoopDetector::new(LoopDetectorConfig {
+            break_enabled: false,
+            ..config_with_repeats(3)
+        });
+        let mut normal = LoopDetector::new(config_with_repeats(3));
+        let args = json!({"path": "/tmp/foo"});
+
+        // Up to the Break threshold both detectors must agree exactly.
+        for i in 0..4 {
+            assert_eq!(
+                capped.record("file_read", &args, "contents"),
+                normal.record("file_read", &args, "contents"),
+                "call {i} must be identical below the Break threshold"
+            );
+        }
+    }
+
+    #[test]
+    fn new_knobs_default_to_current_behavior() {
+        let cfg = LoopDetectorConfig::default();
+        assert!(cfg.no_progress_enabled, "no-progress defaults on");
+        assert!(cfg.break_enabled, "break defaults on");
+
+        // Defaults still Break on exact repeat and still fire no-progress.
+        let mut det = LoopDetector::new(default_config());
+        let args = json!({"q": "test"});
+        for _ in 0..4 {
+            det.record("search", &args, "no results");
+        }
+        assert!(matches!(
+            det.record("search", &args, "no results"),
+            LoopDetectionResult::Break(_)
+        ));
+
+        let mut det = LoopDetector::new(default_config());
+        let mut last = LoopDetectionResult::Ok;
+        for i in 0..5 {
+            last = det.record("probe", &json!({"q": format!("v{i}")}), "same");
+        }
+        assert!(
+            matches!(last, LoopDetectionResult::Warning(_)),
+            "got {last:?}"
+        );
     }
 
     // ── Disabled / config tests ──────────────────────────────────

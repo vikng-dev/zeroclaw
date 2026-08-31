@@ -424,6 +424,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
             no_progress_min_calls: pacing.loop_detection_no_progress_min_calls,
+            no_progress_enabled: pacing.loop_detection_no_progress_enabled,
+            break_enabled: pacing.loop_detection_break_enabled,
         },
     );
 
