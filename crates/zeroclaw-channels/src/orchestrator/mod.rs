@@ -1412,8 +1412,25 @@ fn resolve_channel_thinking(
     }
 }
 
+/// Drop the whole-line `[...]` context annotations some channels prepend to a
+/// turn body (WhatsApp's `[Your id: ...]` and `[Reply to ...: ...]`), so a
+/// slash command typed under them still reads as the first token.
+fn strip_context_preamble(content: &str) -> &str {
+    let mut rest = content.trim();
+    while rest.starts_with('[') {
+        let Some((line, tail)) = rest.split_once('\n') else {
+            break;
+        };
+        if !line.trim_end().ends_with(']') {
+            break;
+        }
+        rest = tail.trim();
+    }
+    rest
+}
+
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    let trimmed = content.trim();
+    let trimmed = strip_context_preamble(content);
     if !trimmed.starts_with('/') {
         return None;
     }
@@ -21233,6 +21250,80 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(ChannelRuntimeCommand::NewSession)
         );
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
+    }
+
+    // WhatsApp prepends `[Your id: ...]` (and `[Reply to ...]`) above the turn
+    // body, which used to push the slash out of first position and hand the
+    // command to the model instead of the runtime.
+    #[test]
+    fn parse_runtime_command_looks_past_bracketed_context_preamble() {
+        assert_eq!(
+            parse_runtime_command(
+                "whatsapp_web",
+                "[Your id: 972553083523, 112975558004947]\n/new"
+            ),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command(
+                "whatsapp_web",
+                "[Reply to 972553083523: earlier turn]\n[Your id: 972553083523]\n/clear"
+            ),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        // An unterminated bracket line is body text, not an annotation.
+        assert_eq!(
+            parse_runtime_command("whatsapp_web", "[not an annotation\n/new"),
+            None
+        );
+        assert_eq!(
+            parse_runtime_command("whatsapp_web", "[Your id: 972553083523]"),
+            None
+        );
+    }
+
+    // Addressing the bot in a group appends its mention as a separate token.
+    #[test]
+    fn parse_runtime_command_ignores_trailing_group_mention() {
+        assert_eq!(
+            parse_runtime_command("whatsapp_web", "/new @112975558004947"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command(
+                "whatsapp_web",
+                "[Your id: 972553083523, 112975558004947]\n/new @112975558004947"
+            ),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_leaves_ordinary_message_under_preamble_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Arc::new(channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "clamps",
+            "openai",
+            "gpt-4o",
+        ));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel {
+            name: "whatsapp_web",
+        });
+        let content = "[Your id: 972553083523, 112975558004947]\nwhat is a slash command?";
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            sender: "alice".into(),
+            reply_target: "chan-1".into(),
+            channel: "whatsapp_web".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: content.into(),
+            ..Default::default()
+        };
+
+        let handled = handle_runtime_command_if_needed(ctx.as_ref(), &msg, Some(&target)).await;
+        assert!(!handled, "ordinary text must not be taken as a command");
+        assert_eq!(msg.content, content, "preamble must reach the agent as-is");
     }
 
     // Build a ChannelRuntimeContext with a Config that has peer_groups
