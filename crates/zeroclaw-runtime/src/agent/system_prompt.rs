@@ -11,11 +11,24 @@ pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
 
+/// Whether a configured extra bootstrap path stays inside the workspace:
+/// relative, and free of `..` traversal.
+fn is_workspace_relative(name: &str) -> bool {
+    use std::path::Component;
+
+    let path = std::path::Path::new(name);
+    !name.trim().is_empty()
+        && path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
     max_chars_per_file: usize,
     inject_memory: bool,
+    extra_files: &[String],
 ) {
     prompt.push_str(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
@@ -38,6 +51,19 @@ fn load_openclaw_bootstrap_files(
     // so that stale long-term memory does not leak into isolated contexts.
     if inject_memory {
         inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+    }
+
+    // Operator-configured extras (`runtime_profile.bootstrap_extra_files`),
+    // in list order. Unlike the fixed five these are optional, so a missing
+    // file is skipped rather than marked; traversal outside the workspace is
+    // refused.
+    for name in extra_files {
+        if !is_workspace_relative(name) {
+            continue;
+        }
+        if workspace_dir.join(name).exists() {
+            inject_workspace_file(prompt, workspace_dir, name, max_chars_per_file);
+        }
     }
 }
 
@@ -80,6 +106,7 @@ pub fn build_system_prompt_with_tool_calls(
         skills,
         identity_config,
         bootstrap_max_chars,
+        &[],
         Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
         false,
         zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
@@ -112,6 +139,7 @@ pub fn build_system_prompt_with_mode(
         skills,
         identity_config,
         bootstrap_max_chars,
+        &[],
         Some(&autonomy_cfg),
         native_tool_specs_present,
         skills_prompt_mode,
@@ -130,6 +158,10 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     skills: &[Skill],
     identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
+    // Workspace-relative files appended to the built-in bootstrap block, in
+    // list order. Missing files are skipped; absolute or `..`-bearing paths
+    // are ignored.
+    bootstrap_extra_files: &[String],
     autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
     native_tool_specs_present: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
@@ -340,6 +372,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                         workspace_dir,
                         max_chars,
                         inject_memory,
+                        bootstrap_extra_files,
                     );
                 }
                 Err(e) => {
@@ -353,18 +386,31 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                         workspace_dir,
                         max_chars,
                         inject_memory,
+                        bootstrap_extra_files,
                     );
                 }
             }
         } else {
             // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, inject_memory);
+            load_openclaw_bootstrap_files(
+                &mut prompt,
+                workspace_dir,
+                max_chars,
+                inject_memory,
+                bootstrap_extra_files,
+            );
         }
     } else {
         // No identity config - use OpenClaw format
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, inject_memory);
+        load_openclaw_bootstrap_files(
+            &mut prompt,
+            workspace_dir,
+            max_chars,
+            inject_memory,
+            bootstrap_extra_files,
+        );
     }
 
     // ── 6. Date ─────────────────────────────────────────────────
@@ -497,6 +543,7 @@ mod tests {
             &[],
             None,
             Some(512),
+            &[],
             Some(&autonomy),
             false,
             SkillsPromptInjectionMode::Full,
@@ -606,5 +653,125 @@ mod tests {
             !prompt.contains("## Tool Authorization"),
             "Tool Authorization should be skipped when no power tools (shell/file_write/file_edit) are registered"
         );
+    }
+
+    fn build_with_extras(workspace: &std::path::Path, extras: &[String]) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            workspace,
+            "test-model",
+            &[],
+            &[],
+            None,
+            Some(512),
+            extras,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+        )
+    }
+
+    #[test]
+    fn bootstrap_extra_files_are_injected_after_the_builtins() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(workspace.path().join("USER.md"), "user notes").expect("write USER.md");
+        std::fs::write(workspace.path().join("EXTRA.md"), "extra bootstrap payload")
+            .expect("write EXTRA.md");
+
+        let baseline = build_with_extras(workspace.path(), &[]);
+        assert!(
+            !baseline.contains("extra bootstrap payload"),
+            "extra file must not be injected when it is not configured"
+        );
+
+        let prompt = build_with_extras(workspace.path(), &["EXTRA.md".to_string()]);
+        assert!(
+            prompt.contains("### EXTRA.md"),
+            "configured extra file should get its own heading"
+        );
+        assert!(
+            prompt.contains("extra bootstrap payload"),
+            "configured extra file content should be injected"
+        );
+        let builtin_at = prompt.find("### USER.md").expect("USER.md injected");
+        let extra_at = prompt.find("### EXTRA.md").expect("EXTRA.md injected");
+        assert!(
+            extra_at > builtin_at,
+            "extra files must come after the built-in bootstrap files"
+        );
+    }
+
+    #[test]
+    fn bootstrap_extra_files_are_injected_in_list_order() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir(workspace.path().join("shared")).expect("mkdir shared");
+        std::fs::write(
+            workspace.path().join("shared/AGENTS.md"),
+            "shared fleet rules",
+        )
+        .expect("write shared/AGENTS.md");
+        std::fs::write(workspace.path().join("SECOND.md"), "second payload")
+            .expect("write SECOND.md");
+
+        let prompt = build_with_extras(
+            workspace.path(),
+            &["shared/AGENTS.md".to_string(), "SECOND.md".to_string()],
+        );
+        let first_at = prompt
+            .find("### shared/AGENTS.md")
+            .expect("nested extra file injected under its relative name");
+        let second_at = prompt.find("### SECOND.md").expect("SECOND.md injected");
+        assert!(
+            prompt.contains("shared fleet rules"),
+            "nested extra file content should be injected"
+        );
+        assert!(
+            first_at < second_at,
+            "extra files must be injected in configured list order"
+        );
+    }
+
+    #[test]
+    fn missing_bootstrap_extra_file_leaves_the_prompt_byte_identical() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(workspace.path().join("USER.md"), "user notes").expect("write USER.md");
+
+        let baseline = build_with_extras(workspace.path(), &[]);
+        let configured = build_with_extras(workspace.path(), &["ABSENT.md".to_string()]);
+
+        assert_eq!(
+            baseline, configured,
+            "a configured-but-missing extra file must be skipped silently, with no marker"
+        );
+    }
+
+    #[test]
+    fn bootstrap_extra_files_outside_the_workspace_are_skipped() {
+        let outer = tempfile::TempDir::new().expect("tempdir");
+        let workspace = outer.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("mkdir workspace");
+        std::fs::write(workspace.join("USER.md"), "user notes").expect("write USER.md");
+
+        let escape = outer.path().join("escape.md");
+        std::fs::write(&escape, "secret outside the workspace").expect("write escape.md");
+
+        let baseline = build_with_extras(&workspace, &[]);
+        for candidate in [
+            "../escape.md".to_string(),
+            escape.to_string_lossy().into_owned(),
+        ] {
+            let prompt = build_with_extras(&workspace, std::slice::from_ref(&candidate));
+            assert!(
+                !prompt.contains("secret outside the workspace"),
+                "{candidate} escaped the workspace containment guard"
+            );
+            assert_eq!(
+                baseline, prompt,
+                "{candidate} must be ignored without changing the prompt"
+            );
+        }
     }
 }

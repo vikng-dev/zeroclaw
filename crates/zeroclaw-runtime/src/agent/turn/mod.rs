@@ -1583,6 +1583,7 @@ fn build_owned_step_system_prompt(
         &owned.skills,
         Some(&owned.agent.identity),
         bootstrap_max_chars,
+        &owned.agent.resolved.bootstrap_extra_files,
         &owned.risk_profile,
         owned.model_provider.as_ref(),
         &owned.tools_registry,

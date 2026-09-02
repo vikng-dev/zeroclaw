@@ -3380,6 +3380,10 @@ pub struct ResolvedRuntime {
     pub tool_call_dedup_exempt: Vec<String>,
     pub tool_filter_groups: Vec<ToolFilterGroup>,
     pub max_system_prompt_chars: usize,
+    /// Extra workspace-relative files injected into the always-on bootstrap
+    /// block after the built-in ones, in list order. Missing files are
+    /// skipped; absolute paths and paths containing `..` are ignored.
+    pub bootstrap_extra_files: Vec<String>,
     pub thinking: crate::scattered_types::ThinkingConfig,
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
     pub eval: crate::scattered_types::EvalConfig,
@@ -3420,6 +3424,7 @@ impl Default for ResolvedRuntime {
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
+            bootstrap_extra_files: Vec::new(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
@@ -4117,6 +4122,13 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_bootstrap_extra_files(&self, agent_alias: &str) -> Vec<String> {
+        self.runtime_profile_for_agent(agent_alias)
+            .map(|p| p.bootstrap_extra_files.clone())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
     pub fn effective_max_tool_result_chars(&self, agent_alias: &str) -> usize {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_tool_result_chars)
@@ -4165,6 +4177,7 @@ impl Config {
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
             tool_call_dedup_exempt: self.effective_tool_call_dedup_exempt(agent_alias),
             max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
+            bootstrap_extra_files: self.effective_bootstrap_extra_files(agent_alias),
             max_tool_result_chars: self.effective_max_tool_result_chars(agent_alias),
             keep_tool_context_turns: self.effective_keep_tool_context_turns(agent_alias),
             tool_context_mode: self.effective_tool_context_mode(agent_alias),
@@ -12073,6 +12086,13 @@ pub struct RuntimeProfileConfig {
     pub tool_call_dedup_exempt: Vec<String>,
     /// Maximum characters for the assembled system prompt. `None` inherits.
     pub max_system_prompt_chars: Option<usize>,
+    /// Extra workspace-relative files injected into the always-on bootstrap
+    /// block, after the built-in ones (`AGENTS.md`, `SOUL.md`, …) and in list
+    /// order. Each entry obeys the same per-file character cap. A file that
+    /// does not exist is skipped silently; absolute paths and paths whose
+    /// components include `..` are ignored so injection stays inside the
+    /// agent workspace.
+    pub bootstrap_extra_files: Vec<String>,
     /// Maximum characters for a single tool result. `None` inherits.
     pub max_tool_result_chars: Option<usize>,
     /// Number of recent turns whose full tool context is preserved. `None` inherits.
@@ -12129,6 +12149,7 @@ impl Default for RuntimeProfileConfig {
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             max_system_prompt_chars: None,
+            bootstrap_extra_files: Vec::new(),
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
             tool_context_mode: None,
