@@ -1061,10 +1061,53 @@ pub(crate) fn append_utf8_stream_chunk(
     }
 }
 
-fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
-    let body_trimmed = body.trim_start();
-    let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
-    if looks_like_sse {
+/// What the transport declared the Responses body to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesBodyKind {
+    Sse,
+    Json,
+    /// No usable `Content-Type`; fall back to sniffing the body.
+    Unknown,
+}
+
+impl ResponsesBodyKind {
+    fn from_content_type(content_type: Option<&str>) -> Self {
+        let Some(content_type) = content_type else {
+            return Self::Unknown;
+        };
+        let media_type = content_type.split(';').next().unwrap_or_default().trim();
+        if media_type.eq_ignore_ascii_case("text/event-stream") {
+            Self::Sse
+        } else if media_type.eq_ignore_ascii_case("application/json") {
+            Self::Json
+        } else {
+            Self::Unknown
+        }
+    }
+
+    fn from_response(response: &reqwest::Response) -> Self {
+        Self::from_content_type(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        )
+    }
+}
+
+fn parse_responses_body(
+    body: &str,
+    kind: ResponsesBodyKind,
+) -> anyhow::Result<ResponsesTurnResult> {
+    let is_sse = match kind {
+        ResponsesBodyKind::Sse => true,
+        ResponsesBodyKind::Json => false,
+        ResponsesBodyKind::Unknown => {
+            let body_trimmed = body.trim_start();
+            body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:")
+        }
+    };
+    if is_sse {
         let result = parse_sse_turn(body)?;
         return ensure_nonempty_responses_turn(result, || {
             let sanitized = super::sanitize_api_error(body);
@@ -1112,6 +1155,7 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
 }
 
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<ResponsesTurnResult> {
+    let kind = ResponsesBodyKind::from_response(&response);
     let mut body = String::new();
     let mut pending_utf8 = Vec::new();
     let mut stream = response.bytes_stream();
@@ -1164,7 +1208,7 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
         )));
     }
 
-    parse_responses_body(&body)
+    parse_responses_body(&body, kind)
 }
 
 struct ResolvedCodexCredentials {
@@ -2058,6 +2102,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_accepts_stream_opening_with_keepalive_comment() {
+        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+            MockCodexReply::Sse(
+                ": hold\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"held\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"held\"}}\n\ndata: [DONE]\n",
+            ),
+        ])
+        .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect("keep-alive comment lines are valid SSE");
+
+        assert_eq!(response.text.as_deref(), Some("held"));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "no non-streaming retry expected");
+        assert_eq!(requests[0]["stream"], true);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
     async fn codex_retries_non_streaming_when_stream_contains_malformed_frame_after_text() {
         let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
             MockCodexReply::Sse(
@@ -2275,7 +2351,8 @@ data: [DONE]
 data: [DONE]
 "#;
 
-        let err = parse_responses_body(payload).expect_err("empty SSE should fail closed");
+        let err = parse_responses_body(payload, ResponsesBodyKind::Unknown)
+            .expect_err("empty SSE should fail closed");
         assert!(
             err.to_string()
                 .contains("OpenAI Codex SSE data parse failed"),
@@ -2287,7 +2364,8 @@ data: [DONE]
     fn parse_responses_body_rejects_json_without_text_or_tool_calls() {
         let payload = r#"{"output":[]}"#;
 
-        let err = parse_responses_body(payload).expect_err("empty JSON should fail closed");
+        let err = parse_responses_body(payload, ResponsesBodyKind::Unknown)
+            .expect_err("empty JSON should fail closed");
         assert!(
             err.to_string().contains("No response from OpenAI Codex"),
             "{err}"
@@ -2302,12 +2380,95 @@ data: [DONE]
         })
         .to_string();
 
-        let result = parse_responses_body(&payload).expect("JSON text should not be parsed as SSE");
+        let result = parse_responses_body(&payload, ResponsesBodyKind::Unknown)
+            .expect("JSON text should not be parsed as SSE");
         assert_eq!(
             result.text.as_deref(),
             Some("Example SSE frame:\ndata: {\"type\":\"example\"}\nevent: response.done")
         );
         assert!(result.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_turn_ignores_leading_comment_keepalive() {
+        let payload = r#": hold
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Hello"}
+
+: hold
+data: {"type":"response.output_text.delta","delta":" world"}
+
+data: {"type":"response.completed","response":{"output_text":"Hello world"}}
+data: [DONE]
+"#;
+
+        assert_eq!(
+            parse_sse_turn(payload).unwrap().text.as_deref(),
+            Some("Hello world")
+        );
+    }
+
+    #[test]
+    fn responses_body_kind_reads_content_type_media_type() {
+        assert_eq!(
+            ResponsesBodyKind::from_content_type(Some("text/event-stream; charset=utf-8")),
+            ResponsesBodyKind::Sse
+        );
+        assert_eq!(
+            ResponsesBodyKind::from_content_type(Some("Application/JSON")),
+            ResponsesBodyKind::Json
+        );
+        assert_eq!(
+            ResponsesBodyKind::from_content_type(Some("text/plain")),
+            ResponsesBodyKind::Unknown
+        );
+        assert_eq!(
+            ResponsesBodyKind::from_content_type(None),
+            ResponsesBodyKind::Unknown
+        );
+    }
+
+    #[test]
+    fn parse_responses_body_trusts_sse_content_type_over_leading_comment() {
+        let payload = ": hold\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"held\"}}\n\ndata: [DONE]\n";
+
+        let result = parse_responses_body(payload, ResponsesBodyKind::Sse)
+            .expect("declared SSE body should parse despite the leading comment");
+        assert_eq!(result.text.as_deref(), Some("held"));
+    }
+
+    #[test]
+    fn parse_responses_body_trusts_json_content_type_over_sse_markers() {
+        let payload = serde_json::json!({
+            "output_text": "data: not a frame",
+            "output": []
+        })
+        .to_string();
+
+        let result = parse_responses_body(&payload, ResponsesBodyKind::Json)
+            .expect("declared JSON body should parse as JSON");
+        assert_eq!(result.text.as_deref(), Some("data: not a frame"));
+    }
+
+    #[test]
+    fn parse_responses_body_sniffs_when_content_type_is_unknown() {
+        let sse = "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"sniffed\"}}\n\ndata: [DONE]\n";
+        let result = parse_responses_body(sse, ResponsesBodyKind::Unknown)
+            .expect("SSE markers should be sniffed without a content type");
+        assert_eq!(result.text.as_deref(), Some("sniffed"));
+
+        let json = serde_json::json!({"output_text": "plain", "output": []}).to_string();
+        let result = parse_responses_body(&json, ResponsesBodyKind::Unknown)
+            .expect("JSON should be sniffed without a content type");
+        assert_eq!(result.text.as_deref(), Some("plain"));
+
+        let err = parse_responses_body(": hold\n\ndata: [DONE]\n", ResponsesBodyKind::Unknown)
+            .expect_err("a comment-led body cannot be sniffed as SSE");
+        assert!(
+            err.to_string().contains("OpenAI Codex JSON parse failed"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2332,7 +2493,8 @@ data: [DONE]
         })
         .to_string();
 
-        let result = parse_responses_body(&payload).expect("tool call response should parse");
+        let result = parse_responses_body(&payload, ResponsesBodyKind::Unknown)
+            .expect("tool call response should parse");
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].id, "call_1");
 
