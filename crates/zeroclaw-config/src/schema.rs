@@ -18288,6 +18288,33 @@ async fn try_resolve_macos_homebrew_config_dir(exe: &Path) -> Option<PathBuf> {
     Some(prefix.join("var").join("zeroclaw"))
 }
 
+/// `ZEROCLAW_DATA_DIR` read as a standalone data location, for use when
+/// `ZEROCLAW_CONFIG_DIR` already pins the config directory. Must be
+/// absolute: there is no meaningful base to resolve a relative path
+/// against, and silently joining it under the config directory would
+/// hide the mistake.
+fn env_data_dir_override() -> Result<Option<PathBuf>> {
+    let Some(raw) = std::env::var("ZEROCLAW_DATA_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let expanded = expand_tilde_path(&raw);
+    anyhow::ensure!(
+        expanded.is_absolute(),
+        "ZEROCLAW_DATA_DIR must be an absolute path when ZEROCLAW_CONFIG_DIR is set (got {raw:?})"
+    );
+    Ok(Some(expanded))
+}
+
+/// Resolve the config directory and the shared instance data directory.
+///
+/// The data directory is `<config-dir>/data` unless `ZEROCLAW_CONFIG_DIR`
+/// and `ZEROCLAW_DATA_DIR` are both set, in which case the two are
+/// independent locations. `ZEROCLAW_DATA_DIR` on its own (and its
+/// deprecated alias `ZEROCLAW_WORKSPACE`) pins the install root instead.
 async fn resolve_runtime_config_dirs(
     default_zeroclaw_dir: &Path,
     default_data_dir: &Path,
@@ -18295,23 +18322,6 @@ async fn resolve_runtime_config_dirs(
     if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
-            // If the operator ALSO set ZEROCLAW_DATA_DIR or
-            // ZEROCLAW_WORKSPACE, CONFIG_DIR wins; surface the
-            // collision so they know which one took effect.
-            if std::env::var("ZEROCLAW_DATA_DIR")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .is_some()
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "ZEROCLAW_CONFIG_DIR is set; ZEROCLAW_DATA_DIR is ignored \
-                     (CONFIG_DIR pins both the config directory and the data \
-                     directory under it)."
-                );
-            }
             if std::env::var("ZEROCLAW_WORKSPACE")
                 .ok()
                 .filter(|v| !v.is_empty())
@@ -18327,11 +18337,11 @@ async fn resolve_runtime_config_dirs(
                 );
             }
             let zeroclaw_dir = expand_tilde_path(custom_config_dir);
-            return Ok((
-                zeroclaw_dir.clone(),
-                zeroclaw_dir.join("data"),
-                ConfigResolutionSource::EnvConfigDir,
-            ));
+            let data_dir = match env_data_dir_override()? {
+                Some(data_dir) => data_dir,
+                None => zeroclaw_dir.join("data"),
+            };
+            return Ok((zeroclaw_dir, data_dir, ConfigResolutionSource::EnvConfigDir));
         }
     }
 
@@ -18353,7 +18363,8 @@ async fn resolve_runtime_config_dirs(
             );
         }
         let expanded = expand_tilde_path(&custom_data);
-        let (zeroclaw_dir, data_dir) = resolve_config_dir_for_data(&expanded);
+        let (zeroclaw_dir, _) = resolve_config_dir_for_data(&expanded);
+        let data_dir = zeroclaw_dir.join("data");
         return Ok((zeroclaw_dir, data_dir, ConfigResolutionSource::EnvDataDir));
     }
 
@@ -18368,7 +18379,8 @@ async fn resolve_runtime_config_dirs(
              ZEROCLAW_WORKSPACE will be removed in a future release."
         );
         let expanded = expand_tilde_path(&custom_workspace);
-        let (zeroclaw_dir, data_dir) = resolve_config_dir_for_data(&expanded);
+        let (zeroclaw_dir, _) = resolve_config_dir_for_data(&expanded);
+        let data_dir = zeroclaw_dir.join("data");
         return Ok((
             zeroclaw_dir,
             data_dir,
@@ -18380,9 +18392,10 @@ async fn resolve_runtime_config_dirs(
         && let Ok(exe) = std::env::current_exe()
         && let Some(homebrew_config_dir) = try_resolve_macos_homebrew_config_dir(&exe).await
     {
+        let data_dir = homebrew_config_dir.join("data");
         return Ok((
-            homebrew_config_dir.clone(),
-            homebrew_config_dir.join("workspace"),
+            homebrew_config_dir,
+            data_dir,
             ConfigResolutionSource::HomebrewConfigDir,
         ));
     }
@@ -18854,7 +18867,7 @@ impl Config {
         // migration against `default_zeroclaw_dir` would silently skip
         // any install reached via `ZEROCLAW_CONFIG_DIR` or
         // `ZEROCLAW_WORKSPACE`.
-        let (zeroclaw_dir, _legacy_workspace_dir, resolution_source) =
+        let (zeroclaw_dir, data_dir, resolution_source) =
             resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
 
         // One-time, V<3 → V3 ONLY move of `<install>/workspace/` into
@@ -18928,12 +18941,11 @@ impl Config {
         // pre-multi-agent install's `<install>/workspace/` is present
         // and needs to be moved into the new layout.
         //
-        // `config.data_dir` resolves to `<install>/data/` — the shared
-        // instance data directory holding databases (memory, sessions,
-        // cost records) and hygiene/state files. Per-agent identity
-        // and markdown (MEMORY.md, IDENTITY.md, SOUL.md) lives at
-        // `Config::agent_workspace_dir(alias)` instead.
-        let data_dir = zeroclaw_dir.join("data");
+        // `config.data_dir` is the shared instance data directory holding
+        // databases (memory, sessions, cost records) and hygiene/state
+        // files: `<install>/data/` unless `ZEROCLAW_DATA_DIR` relocated
+        // it. Per-agent identity and markdown (MEMORY.md, IDENTITY.md,
+        // SOUL.md) lives at `Config::agent_workspace_dir(alias)` instead.
         fs::create_dir_all(&data_dir).await.with_context(|| {
             format!(
                 "Failed to create data directory: {}",
@@ -18947,14 +18959,21 @@ impl Config {
         // `<install>/shared/` — root workspace shared across every agent
         // on the host. Holds skills, skill bundles, and other content
         // not scoped to a single agent. Per-agent state still lives at
-        // `<install>/agents/<alias>/workspace/`.
+        // `<install>/agents/<alias>/workspace/`. Nothing at boot depends
+        // on it, so a read-only install root only warns.
         let shared_dir = zeroclaw_dir.join("shared");
-        fs::create_dir_all(&shared_dir).await.with_context(|| {
-            format!(
-                "Failed to create shared workspace directory: {}",
-                shared_dir.display()
-            )
-        })?;
+        if let Err(e) = fs::create_dir_all(&shared_dir).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "path": shared_dir.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "[system] shared workspace directory creation failed; continuing"
+            );
+        }
 
         fs::create_dir_all(&zeroclaw_dir)
             .await
@@ -29009,6 +29028,7 @@ wire_api = "ws"
         unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir) };
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
 
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -29022,6 +29042,111 @@ wire_api = "ws"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_honors_data_dir_alongside_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let default_config_dir = root.join("default-config");
+        let default_data_dir = default_config_dir.join("data");
+        let explicit_config_dir = root.join("config");
+        let explicit_data_dir = root.join("state");
+
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", &explicit_config_dir);
+        let _data_guard = EnvValueGuard::set("ZEROCLAW_DATA_DIR", &explicit_data_dir);
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let (config_dir, data_dir, source) =
+            resolve_runtime_config_dirs(&default_config_dir, &default_data_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(source, ConfigResolutionSource::EnvConfigDir);
+        assert_eq!(config_dir, explicit_config_dir);
+        assert_eq!(data_dir, explicit_data_dir);
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_rejects_relative_data_dir_alongside_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let default_config_dir = root.join("default-config");
+        let default_data_dir = default_config_dir.join("data");
+
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", root.join("config"));
+        let _data_guard = EnvValueGuard::set("ZEROCLAW_DATA_DIR", "relative/state");
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let err = resolve_runtime_config_dirs(&default_config_dir, &default_data_dir)
+            .await
+            .expect_err("a relative ZEROCLAW_DATA_DIR has no base to resolve against");
+        assert!(
+            err.to_string()
+                .contains("ZEROCLAW_DATA_DIR must be an absolute path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    async fn load_or_init_uses_data_dir_alongside_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        let data_dir = root.join("state");
+
+        let _home_guard = EnvValueGuard::set("HOME", &root);
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", &config_dir);
+        let _data_guard = EnvValueGuard::set("ZEROCLAW_DATA_DIR", &data_dir);
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert_eq!(config.config_path, config_dir.join("config.toml"));
+        assert_eq!(config.data_dir, data_dir);
+        assert!(
+            data_dir.is_dir(),
+            "data dir is created where the env var points"
+        );
+        assert!(
+            !config_dir.join("data").exists(),
+            "no data dir is derived under the config dir"
+        );
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn load_or_init_tolerates_read_only_config_dir_with_external_data_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_guard = env_override_lock().await;
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        let data_dir = root.join("state");
+
+        fs::create_dir_all(&config_dir).await.unwrap();
+        fs::write(config_dir.join("config.toml"), "schema_version = 3\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let _home_guard = EnvValueGuard::set("HOME", &root);
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", &config_dir);
+        let _data_guard = EnvValueGuard::set("ZEROCLAW_DATA_DIR", &data_dir);
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let loaded = Box::pin(Config::load_or_init()).await;
+
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = loaded.expect("a read-only config dir must not block boot");
+        assert_eq!(config.data_dir, data_dir);
+        assert!(data_dir.is_dir());
+
+        let _ = fs::remove_dir_all(root).await;
     }
 
     #[test]

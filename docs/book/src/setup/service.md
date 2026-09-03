@@ -215,7 +215,7 @@ The service reads config from whichever directory resolved at install time. Prec
 4. On macOS only, the Homebrew config dir (`$HOMEBREW_PREFIX/var/zeroclaw/`) when installed via Homebrew
 5. Default `~/.zeroclaw/` (Linux/macOS) or `%USERPROFILE%\.zeroclaw\` (Windows)
 
-`ZEROCLAW_CONFIG_DIR` overrides everything; setting it alongside `ZEROCLAW_DATA_DIR` or `ZEROCLAW_WORKSPACE` logs a warning and ignores the others.
+`ZEROCLAW_CONFIG_DIR` decides where `config.toml` lives. Instance data (databases, state files) defaults to `<config dir>/data`; set `ZEROCLAW_DATA_DIR` to an absolute path alongside it to keep data somewhere else (for example when the config directory is a read-only mount). `ZEROCLAW_WORKSPACE` is ignored when `ZEROCLAW_CONFIG_DIR` is set.
 
 If your service seems to ignore config changes, check which path the daemon resolved against, `zeroclaw status` reports the active config file, and the runtime logs a resolution-source line at startup:
 
