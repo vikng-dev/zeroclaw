@@ -2589,6 +2589,52 @@ fn optional_channel_routes() -> Router<AppState> {
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// Optional channel delivery, same shape as a cron job's `delivery`
+    /// (`{mode: "announce", channel, to, thread_id?, best_effort?}`). When
+    /// present the turn runs detached and its reply is announced to the
+    /// target; the request returns `202` right away. Omitted: the turn
+    /// runs inline and the reply comes back in the response.
+    #[serde(default)]
+    pub delivery: Option<zeroclaw_runtime::cron::DeliveryConfig>,
+}
+
+/// Reject a webhook `delivery` the announcement path could not honour:
+/// anything but announce mode, a missing target, or a channel that is not
+/// a configured, enabled instance. Cron accepts dangling channel refs
+/// (the job may outlive a channel); a one-shot webhook has nowhere to
+/// surface that later, so it fails at the request instead.
+fn validate_webhook_delivery(
+    config: &Config,
+    delivery: &zeroclaw_runtime::cron::DeliveryConfig,
+) -> anyhow::Result<()> {
+    if !delivery.mode.eq_ignore_ascii_case("announce") {
+        anyhow::bail!("delivery.mode must be \"announce\" (omit delivery for an inline reply)");
+    }
+    zeroclaw_runtime::cron::validate_delivery_config(Some(delivery))?;
+    let channel = delivery.channel.as_deref().unwrap_or_default().trim();
+    if !webhook_delivery_channel_is_configured(config, channel) {
+        anyhow::bail!("delivery.channel {channel:?} is not a configured, enabled channel");
+    }
+    Ok(())
+}
+
+/// True when `channel` names exactly one enabled `[channels.<type>.<alias>]`
+/// block: a dotted `<type>.<alias>` ref, or a bare `<type>` with a single
+/// enabled instance (the same shorthand the live channel registry keys).
+fn webhook_delivery_channel_is_configured(config: &Config, channel: &str) -> bool {
+    let (wanted_type, wanted_alias) = match channel.split_once('.') {
+        Some((channel_type, alias)) => (channel_type, Some(alias)),
+        None => (channel, None),
+    };
+    let normalize = |channel_type: &str| channel_type.to_ascii_lowercase().replace('_', "-");
+    let wanted_type = normalize(wanted_type);
+    config
+        .channels_by_alias()
+        .iter()
+        .filter(|info| info.enabled && normalize(&info.channel_type) == wanted_type)
+        .filter(|info| wanted_alias.is_none_or(|alias| alias == info.alias))
+        .count()
+        == 1
 }
 
 /// Webhook query parameters
@@ -2731,6 +2777,23 @@ async fn handle_webhook(
         }
     }
 
+    // ── Delivery target (optional `delivery` body field) ──
+    // Same pre-idempotency placement as the agent check: an unusable
+    // target must not consume the caller's key.
+    if let Some(delivery) = webhook_body.delivery.as_ref()
+        && let Err(e) = validate_webhook_delivery(&state.config.read(), delivery)
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+            "webhook: rejected — invalid delivery"
+        );
+        let err = serde_json::json!({"error": format!("Invalid delivery: {e}")});
+        return (StatusCode::BAD_REQUEST, Json(err));
+    }
+
     // ── Idempotency (optional) ──
     if let Some(idempotency_key) = headers
         .get("X-Idempotency-Key")
@@ -2767,6 +2830,26 @@ async fn handle_webhook(
                 session_id.as_deref(),
             )
             .await;
+    }
+
+    // ── Detached run with channel delivery ──
+    // The reply goes to the channel, not the caller, so the turn is not
+    // held to the HTTP timeout: acknowledge now, run in the background.
+    if let Some(delivery) = webhook_body.delivery.clone() {
+        let id = Uuid::new_v4().to_string();
+        let turn = WebhookDeliveryTurn {
+            id: id.clone(),
+            message: message.clone(),
+            session_id,
+            agent_override: agent_override.map(str::to_string),
+            delivery,
+        };
+        let state = state.clone();
+        zeroclaw_spawn::spawn!(async move {
+            run_webhook_delivery_turn(&state, turn).await;
+        });
+        let body = serde_json::json!({"status": "accepted", "id": id});
+        return (StatusCode::ACCEPTED, Json(body));
     }
 
     let model_label = {
@@ -2840,6 +2923,114 @@ async fn handle_webhook(
                 let err = serde_json::json!({"error": "LLM request failed"});
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
             }
+        }
+    }
+}
+
+/// One accepted `/webhook` turn whose reply is delivered to a channel.
+struct WebhookDeliveryTurn {
+    /// Correlation id returned to the caller in the `202` body; every log
+    /// line the detached run emits carries it.
+    id: String,
+    message: String,
+    session_id: Option<String>,
+    agent_override: Option<String>,
+    delivery: zeroclaw_runtime::cron::DeliveryConfig,
+}
+
+/// Run an accepted webhook turn and announce its reply on the delivery
+/// target, the way the cron scheduler announces a job's output: a quiet
+/// `NO_REPLY` suppresses the send, a failed send is logged at `warn`
+/// under `best_effort` and `error` otherwise. The caller already has its
+/// `202`, so nothing here is reported back over HTTP.
+async fn run_webhook_delivery_turn(state: &AppState, turn: WebhookDeliveryTurn) {
+    let WebhookDeliveryTurn {
+        id,
+        message,
+        session_id,
+        agent_override,
+        delivery,
+    } = turn;
+    let started_at = Instant::now();
+    let outcome = run_gateway_chat_with_tools(
+        state,
+        &message,
+        session_id.as_deref(),
+        agent_override.as_deref(),
+    )
+    .await;
+    state.observer.record_metric(
+        &zeroclaw_runtime::observability::traits::ObserverMetric::RequestLatency(
+            started_at.elapsed(),
+        ),
+    );
+    let response = match outcome {
+        Ok(GatewayChatOutcome { response, .. }) => response,
+        Err(e) => {
+            let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            state
+                .observer
+                .record_event(&zeroclaw_runtime::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"id": id, "error": sanitized})),
+                "webhook delivery turn failed"
+            );
+            return;
+        }
+    };
+
+    if !zeroclaw_runtime::cron::scheduler::announce_delivery_decision(&response).should_deliver() {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"id": id})),
+            "webhook turn returned NO_REPLY sentinel — skipping delivery"
+        );
+        return;
+    }
+
+    // Both validated non-empty before the request was accepted.
+    let channel = delivery.channel.as_deref().unwrap_or_default().trim();
+    let target = delivery.to.as_deref().unwrap_or_default().trim();
+    let config = state.config.read().clone();
+    if let Err(e) = zeroclaw_runtime::cron::scheduler::deliver_announcement(
+        &config,
+        channel,
+        target,
+        delivery.thread_id.as_deref(),
+        &response,
+    )
+    .await
+    {
+        let attrs = ::serde_json::json!({
+            "id": id,
+            "channel": channel,
+            "target": target,
+            "error": format!("{e}"),
+        });
+        if delivery.best_effort {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(attrs),
+                "webhook delivery failed (best_effort)"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(attrs),
+                "webhook delivery failed"
+            );
         }
     }
 }
@@ -5567,6 +5758,8 @@ mod tests {
     #[derive(Default)]
     struct MockModelProvider {
         calls: AtomicUsize,
+        /// Fixed reply; `None` answers `"ok"`.
+        reply: Option<String>,
     }
 
     #[async_trait]
@@ -5579,7 +5772,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok("ok".into())
+            Ok(self.reply.clone().unwrap_or_else(|| "ok".into()))
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
@@ -5792,6 +5985,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            delivery: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -5806,6 +6000,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            delivery: None,
         }));
         let second = handle_webhook(
             State(state),
@@ -5906,6 +6101,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                delivery: None,
             })),
         )
         .await
@@ -6023,6 +6219,7 @@ mod tests {
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                delivery: None,
             })),
         )
         .await
@@ -6119,6 +6316,7 @@ mod tests {
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            delivery: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -6133,6 +6331,7 @@ mod tests {
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            delivery: None,
         }));
         let second = handle_webhook(
             State(state),
@@ -6164,6 +6363,295 @@ mod tests {
         assert_eq!(one, two);
         assert_ne!(one, other);
         assert_eq!(one.len(), 64);
+    }
+
+    // ── /webhook with channel delivery ────────────────────────────
+
+    /// State with one enabled `telegram.ops` channel and a mock provider
+    /// answering `reply` (`None` → `"ok"`).
+    fn webhook_delivery_state(reply: Option<&str>) -> (AppState, Arc<MockModelProvider>) {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "ops".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.channels.telegram.insert(
+            "dormant".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let provider_impl = Arc::new(MockModelProvider {
+            calls: AtomicUsize::new(0),
+            reply: reply.map(str::to_string),
+        });
+        let state = AppState {
+            model_provider: provider_impl.clone(),
+            ..crate::api::tests::test_state(config)
+        };
+        (state, provider_impl)
+    }
+
+    fn announce_to(channel: &str, to: &str) -> zeroclaw_runtime::cron::DeliveryConfig {
+        zeroclaw_runtime::cron::DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some(channel.into()),
+            to: Some(to.into()),
+            thread_id: None,
+            best_effort: true,
+        }
+    }
+
+    async fn post_webhook(
+        state: &AppState,
+        headers: HeaderMap,
+        body: WebhookBody,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&payload).unwrap())
+    }
+
+    /// Poll `cond` until it holds; the detached turn has no handle to join.
+    async fn wait_for(cond: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "detached webhook turn did not finish within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_without_delivery_answers_inline() {
+        let (state, provider_impl) = webhook_delivery_state(None);
+
+        let (status, parsed) = post_webhook(
+            &state,
+            HeaderMap::new(),
+            WebhookBody {
+                message: "hello".into(),
+                delivery: None,
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(parsed["response"], "ok");
+        assert!(parsed["model"].is_string());
+        assert!(parsed.get("id").is_none());
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_with_delivery_is_accepted_and_announced() {
+        crate::api::tests::install_test_delivery_fn();
+        let (state, provider_impl) = webhook_delivery_state(None);
+        let target = "webhook-delivery-announced";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Idempotency-Key",
+            HeaderValue::from_static("deliver-once"),
+        );
+        let body = || WebhookBody {
+            message: "hello".into(),
+            delivery: Some(zeroclaw_runtime::cron::DeliveryConfig {
+                thread_id: Some("thread-7".into()),
+                ..announce_to("telegram.ops", target)
+            }),
+        };
+
+        let (status, parsed) = post_webhook(&state, headers.clone(), body()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(parsed["status"], "accepted");
+        let id = parsed["id"].as_str().expect("id is a string");
+        assert!(Uuid::parse_str(id).is_ok(), "id is a uuid: {id}");
+        assert!(parsed.get("response").is_none());
+
+        wait_for(|| !crate::api::tests::recorded_deliveries_to(target).is_empty()).await;
+        let deliveries = crate::api::tests::recorded_deliveries_to(target);
+        assert_eq!(
+            deliveries,
+            vec![(
+                "telegram.ops".to_string(),
+                target.to_string(),
+                Some("thread-7".to_string()),
+                "ok".to_string()
+            )]
+        );
+
+        // Same idempotency semantics as the inline path.
+        let (status, parsed) = post_webhook(&state, headers, body()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(parsed["status"], "duplicate");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_accepts_bare_type_with_single_enabled_instance() {
+        crate::api::tests::install_test_delivery_fn();
+        let (state, _) = webhook_delivery_state(None);
+        let target = "webhook-delivery-bare-type";
+
+        let (status, _) = post_webhook(
+            &state,
+            HeaderMap::new(),
+            WebhookBody {
+                message: "hello".into(),
+                delivery: Some(announce_to("telegram", target)),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        wait_for(|| !crate::api::tests::recorded_deliveries_to(target).is_empty()).await;
+        assert_eq!(
+            crate::api::tests::recorded_deliveries_to(target)[0].0,
+            "telegram"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_rejects_unknown_or_disabled_channel() {
+        let (state, provider_impl) = webhook_delivery_state(None);
+
+        for channel in ["telegram.nope", "telegram.dormant", "discord.ops"] {
+            // A rejected request must not consume the idempotency key.
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Idempotency-Key", HeaderValue::from_static("bad-channel"));
+            let (status, parsed) = post_webhook(
+                &state,
+                headers,
+                WebhookBody {
+                    message: "hello".into(),
+                    delivery: Some(announce_to(channel, "123")),
+                },
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{channel}");
+            assert!(
+                parsed["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("not a configured, enabled channel"),
+                "{channel}: {parsed}"
+            );
+        }
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+        assert!(state.idempotency_store.record_if_new("bad-channel"));
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_rejects_incomplete_target() {
+        let (state, provider_impl) = webhook_delivery_state(None);
+
+        let cases = [
+            (
+                zeroclaw_runtime::cron::DeliveryConfig {
+                    to: None,
+                    ..announce_to("telegram.ops", "")
+                },
+                "delivery.to is required",
+            ),
+            (
+                zeroclaw_runtime::cron::DeliveryConfig {
+                    mode: "none".into(),
+                    ..announce_to("telegram.ops", "123")
+                },
+                "delivery.mode must be \"announce\"",
+            ),
+        ];
+        for (delivery, expected) in cases {
+            let (status, parsed) = post_webhook(
+                &state,
+                HeaderMap::new(),
+                WebhookBody {
+                    message: "hello".into(),
+                    delivery: Some(delivery),
+                },
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{expected}");
+            assert!(
+                parsed["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(expected),
+                "{parsed}"
+            );
+        }
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_suppresses_no_reply() {
+        crate::api::tests::install_test_delivery_fn();
+        let (state, provider_impl) = webhook_delivery_state(Some("NO_REPLY"));
+        let target = "webhook-delivery-no-reply";
+
+        let (status, parsed) = post_webhook(
+            &state,
+            HeaderMap::new(),
+            WebhookBody {
+                message: "anything new?".into(),
+                delivery: Some(announce_to("telegram.ops", target)),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(parsed["status"], "accepted");
+
+        wait_for(|| provider_impl.calls.load(Ordering::SeqCst) == 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(crate::api::tests::recorded_deliveries_to(target).is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_failure_is_logged_not_surfaced() {
+        crate::api::tests::install_test_delivery_fn();
+        let (state, _) = webhook_delivery_state(None);
+        // The shared hook fails this channel; the config needs an enabled
+        // instance under that name for validation to pass.
+        state.config.write().channels.telegram.insert(
+            "fail-delivery".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let target = "webhook-delivery-failed";
+
+        let (status, _) = post_webhook(
+            &state,
+            HeaderMap::new(),
+            WebhookBody {
+                message: "hello".into(),
+                delivery: Some(zeroclaw_runtime::cron::DeliveryConfig {
+                    best_effort: false,
+                    ..announce_to("telegram.fail-delivery", target)
+                }),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        // The send is attempted once and the failure stays in the logs;
+        // the caller already has its 202.
+        wait_for(|| !crate::api::tests::recorded_deliveries_to(target).is_empty()).await;
     }
 
     #[tokio::test]
@@ -6242,6 +6730,7 @@ mod tests {
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                delivery: None,
             })),
         )
         .await
@@ -6334,6 +6823,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                delivery: None,
             })),
         )
         .await
@@ -6422,6 +6912,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                delivery: None,
             })),
         )
         .await

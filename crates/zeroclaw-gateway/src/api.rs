@@ -4466,18 +4466,47 @@ pub(crate) mod tests {
         assert_eq!(runs[0].status, "ok");
     }
 
-    #[tokio::test]
-    async fn cron_api_run_records_best_effort_delivery_failure_as_degraded() {
+    /// One call the process-wide delivery hook received:
+    /// `(channel, target, thread_id, output)`.
+    pub(crate) type DeliveryRecord = (String, String, Option<String>, String);
+
+    static TEST_DELIVERIES: parking_lot::Mutex<Vec<DeliveryRecord>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// Install the crate's single test delivery hook. `register_delivery_fn`
+    /// is a process-wide `OnceLock`, so every test exercising announcement
+    /// delivery shares this one: it records each call and fails any
+    /// channel named `fail-delivery` (bare or as an alias).
+    pub(crate) fn install_test_delivery_fn() {
         zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-            |_config, channel, _target, _thread_id, _output| {
+            |_config, channel, target, thread_id, output| {
                 Box::pin(async move {
-                    if channel == "fail-delivery" {
+                    TEST_DELIVERIES
+                        .lock()
+                        .push((channel.clone(), target, thread_id, output));
+                    if channel.contains("fail-delivery") {
                         anyhow::bail!("synthetic delivery failure");
                     }
                     Ok(())
                 })
             },
         ));
+    }
+
+    /// Deliveries recorded for `target` so far. Tests pick a target unique
+    /// to themselves; the hook is shared across the whole test binary.
+    pub(crate) fn recorded_deliveries_to(target: &str) -> Vec<DeliveryRecord> {
+        TEST_DELIVERIES
+            .lock()
+            .iter()
+            .filter(|(_, to, _, _)| to == target)
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cron_api_run_records_best_effort_delivery_failure_as_degraded() {
+        install_test_delivery_fn();
 
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {

@@ -2,7 +2,7 @@
 
 The `webhook` channel is a generic inbound/outbound HTTP adapter. It runs its own embedded HTTP server on a port you choose, accepts JSON-shaped messages, hands them to the agent, and (optionally) POSTs the agent's replies to a URL you specify. Use it as the universal adapter for any system that can produce an HTTP POST.
 
-> **Not the same as the gateway's `/webhook` endpoint.** The gateway service has its own `POST /webhook` for paired clients hitting the agent over HTTP, that lives under `[gateway]` and is described in [Operations → Network deployment](../ops/network-deployment.md). This page documents the `[channels.webhook]` channel only.
+> **Not the same as the gateway's `/webhook` endpoint.** The gateway service has its own `POST /webhook` for paired clients hitting the agent over HTTP, that lives under `[gateway]` and is described in [Gateway → HTTP API](../gateway/api.md#chat-webhook-post-webhook). This page documents the `[channels.webhook]` channel only.
 
 ## Configuration
 

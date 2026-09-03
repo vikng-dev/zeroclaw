@@ -122,6 +122,51 @@ the page degrades gracefully and points you at the raw spec at
 `/api/openapi.json` so you can use any compatible viewer
 (Insomnia, Postman, Swagger UI, etc.).
 
+## Chat webhook: `POST /webhook`
+
+One agent turn over HTTP. The body is `{"message": "..."}`; `?agent=<alias>`
+picks a configured agent (default: the configured runtime agent), `X-Session-Id` continues
+a session, and `X-Idempotency-Key` makes a retry a no-op (`200 {"status":
+"duplicate"}`). Bearer auth as above, plus `X-Webhook-Secret` when
+`[channels.webhook.<alias>].secret` is set.
+
+By default the turn runs inline and the reply comes back in the response:
+
+```json
+{"response": "…", "model": "<resolved model>"}
+```
+
+Add a `delivery` block, the same shape as a cron job's `delivery`, to send the
+reply to a channel chat instead:
+
+```json
+{
+  "message": "Summarise today's tickets",
+  "delivery": {
+    "mode": "announce",
+    "channel": "telegram.ops",
+    "to": "-1001234567890",
+    "thread_id": "optional",
+    "best_effort": true
+  }
+}
+```
+
+The gateway validates the target up front (`mode` must be `announce`, `to`
+non-empty, `channel` an enabled `<type>.<alias>` instance, or a bare type with
+exactly one enabled instance; `400` otherwise) and answers at once:
+
+```json
+HTTP 202 Accepted
+{"status": "accepted", "id": "3f0c…"}
+```
+
+The turn then runs detached from the request, so it is not bound by the
+gateway's request timeout, and the reply is announced through the same path
+cron jobs use: a `NO_REPLY` reply sends nothing, a failed send is logged with
+the `id` (`warn` under `best_effort`, `error` otherwise). Agent selection,
+session header, and idempotency behave exactly as on the inline path.
+
 ## Event stream contract
 
 `GET /api/events` is a raw Server-Sent Events stream of observable runtime
