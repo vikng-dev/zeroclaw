@@ -2491,9 +2491,14 @@ impl RpcClient {
         &self,
         submission: &crate::wire::BuilderSubmission,
     ) -> Result<QuickstartApplyResult> {
-        self.call(
+        // Apply persists config to disk, may enrich the provider entry over
+        // the network, and can queue behind an in-flight catalog fetch on
+        // the daemon's dispatcher, so it gets the same budget as
+        // `catalog_models` rather than the default call timeout.
+        self.call_with_timeout(
             method::QUICKSTART_APPLY,
             serde_json::json!({ "submission": submission }),
+            std::time::Duration::from_secs(20),
         )
         .await
     }
@@ -3267,6 +3272,10 @@ pub struct ConfigSectionEntry {
     /// back to the flat ungrouped list.
     #[serde(default)]
     pub group: String,
+    /// Stable locale-independent group key. Empty when connected to an older
+    /// daemon; the Config pane then derives it from the legacy English label.
+    #[serde(default)]
+    pub group_key: String,
     #[serde(default)]
     pub shape: Option<SectionShape>,
     #[serde(default)]
@@ -4361,7 +4370,11 @@ mod dashboard_status_tests {
             "config_dir": "/tmp/zeroclaw-profile",
             "config_file": "/tmp/zeroclaw-profile/config.toml",
             "config_kind": "temporary",
-            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock"
+            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock",
+            "shell_profile": {
+                "name": "pwsh",
+                "family": "powershell"
+            }
         });
 
         let status: StatusResult = serde_json::from_value(value).unwrap();
