@@ -2524,24 +2524,22 @@ fn markdown_inline_to_whatsapp_in(line: &str, inside_bold: bool) -> String {
         }
 
         // `[text](url)` → `text: url`; WhatsApp auto-links the bare URL. The
-        // destination runs to the parenthesis that balances the opener
-        // (CommonMark link destinations), so `(b)` inside a path survives.
+        // destination is read with CommonMark's boundaries (angle-bracket
+        // form, balanced or escaped parentheses, optional title), so its
+        // bytes reach the recipient unchanged; anything else stays literal.
         if bytes[i] == b'['
             && let Some(bracket_end) = line[i + 1..].find(']')
         {
             let after_bracket = i + 1 + bracket_end + 1;
             if after_bracket < len
                 && bytes[after_bracket] == b'('
-                && let Some(paren_end) = balanced_paren_end(line, after_bracket)
+                && let Some((url, end)) = parse_link_destination(line, after_bracket)
             {
                 let text = &line[i + 1..i + 1 + bracket_end];
-                let destination = &line[after_bracket + 1..paren_end];
-                // A link title after the destination has no WhatsApp form.
-                let url = destination.split_whitespace().next().unwrap_or("");
                 out.push_str(text);
                 out.push_str(": ");
-                out.push_str(url);
-                i = paren_end + 1;
+                out.push_str(&url);
+                i = end;
                 continue;
             }
         }
@@ -2606,24 +2604,109 @@ fn bare_url_end(text: &str, at: usize) -> Option<usize> {
     Some(end)
 }
 
-/// Byte index of the `)` that balances the `(` at `open`, or `None` when the
-/// parentheses never balance.
+/// Reads the `(destination "title")` tail of an inline link whose `(` sits at
+/// byte `open`. Returns the destination with backslash escapes resolved and
+/// the byte index just past the closing `)`, or `None` when the bytes are not
+/// a CommonMark link destination (the caller then keeps them literal).
+///
+/// CommonMark allows two destination forms: `<...>` (any characters except an
+/// unescaped `<` or `>`, so spaces are allowed) and a bare run without spaces
+/// or control characters in which parentheses must be balanced or escaped.
+/// An optional title (`"..."`, `'...'` or `(...)`) may follow after spaces.
 #[cfg(feature = "whatsapp-web")]
-fn balanced_paren_end(text: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (offset, byte) in text.as_bytes()[open..].iter().enumerate() {
-        match byte {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + offset);
+fn parse_link_destination(text: &str, open: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let escaped =
+        |at: usize| bytes[at] == b'\\' && bytes.get(at + 1).is_some_and(u8::is_ascii_punctuation);
+    let skip_spaces = |mut at: usize| {
+        while at < bytes.len() && (bytes[at] == b' ' || bytes[at] == b'\t') {
+            at += 1;
+        }
+        at
+    };
+
+    let mut i = skip_spaces(open + 1);
+    let mut url = String::new();
+    if bytes.get(i) == Some(&b'<') {
+        i += 1;
+        loop {
+            match *bytes.get(i)? {
+                b'>' => {
+                    i += 1;
+                    break;
+                }
+                b'<' => return None,
+                _ if escaped(i) => {
+                    url.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+                _ => {
+                    let ch = text[i..].chars().next()?;
+                    url.push(ch);
+                    i += ch.len_utf8();
                 }
             }
-            _ => {}
+        }
+    } else {
+        let mut depth = 0usize;
+        loop {
+            match *bytes.get(i)? {
+                b')' if depth == 0 => break,
+                b' ' | b'\t' => break,
+                _ if escaped(i) => {
+                    url.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+                b'(' => {
+                    depth += 1;
+                    url.push('(');
+                    i += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    url.push(')');
+                    i += 1;
+                }
+                b if b.is_ascii_control() => return None,
+                _ => {
+                    let ch = text[i..].chars().next()?;
+                    url.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
         }
     }
-    None
+
+    // A title has no WhatsApp form; it is parsed only to find the closing `)`.
+    let after_destination = i;
+    i = skip_spaces(i);
+    if i > after_destination
+        && let Some(close) = match bytes.get(i) {
+            Some(b'"') => Some(b'"'),
+            Some(b'\'') => Some(b'\''),
+            Some(b'(') => Some(b')'),
+            _ => None,
+        }
+    {
+        let opener = bytes[i];
+        i += 1;
+        loop {
+            let b = *bytes.get(i)?;
+            if escaped(i) {
+                i += 2;
+            } else if b == close {
+                i += 1;
+                break;
+            } else if b == opener && opener == b'(' {
+                return None;
+            } else {
+                i += 1;
+            }
+        }
+        i = skip_spaces(i);
+    }
+
+    (bytes.get(i) == Some(&b')')).then(|| (url, i + 1))
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -6982,6 +7065,48 @@ mod tests {
         assert_eq!(
             markdown_to_whatsapp(input),
             "*Report*\n\nThe *build* is green.\n\n- run `cargo test`\n- read the log: https://ci.example.com/1\n"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn link_destination_boundaries_follow_commonmark() {
+        // An angle-bracket destination may contain spaces.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](<https://example.test/a b>)"),
+            "docs: https://example.test/a b"
+        );
+        // An escaped parenthesis belongs to the destination.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a\\)b)"),
+            "docs: https://example.test/a)b"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](<https://example.test/a\\>b>)"),
+            "docs: https://example.test/a>b"
+        );
+        // A title in any of its three forms is dropped, not sent as URL.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/x \"Title\")"),
+            "docs: https://example.test/x"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/x 'Title')"),
+            "docs: https://example.test/x"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/x (Title))"),
+            "docs: https://example.test/x"
+        );
+        // Not a CommonMark link: an unclosed angle bracket or a bare
+        // destination with a space stays literal.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](<https://example.test/a b)"),
+            "[docs](<https://example.test/a b)"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a b)"),
+            "[docs](https://example.test/a b)"
         );
     }
 
