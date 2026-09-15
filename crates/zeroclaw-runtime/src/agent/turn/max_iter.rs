@@ -230,7 +230,7 @@ pub(crate) async fn finish_after_max_iterations(
     };
     if display_text.trim().is_empty() {
         history.pop();
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        return Err(max_iterations_stop(max_iterations).into());
     }
     // History and result payloads keep the unmodified provider text; only the
     // display path is normalized, matching the final-response contract.
@@ -741,6 +741,29 @@ mod graceful_summary_metering_tests {
         assert!(
             delta.contains("Turn stopped: reached maximum tool iterations (2)"),
             "chunk must still carry the stop reason: {delta}"
+        );
+    }
+
+    // A summary that is only a terminal marker passes the semantic-empty
+    // check (which strips think tags, not markers) and is emptied by display
+    // cleanup; that exit must carry the same typed stop as the other cap exits.
+    #[tokio::test]
+    async fn graceful_summary_of_only_a_terminal_marker_is_a_typed_max_iterations_stop() {
+        let provider = RawTextProvider {
+            text: "<|eom|>".to_string(),
+        };
+        let error = run_summary(&provider)
+            .await
+            .expect_err("a marker-only summary is not a terminal answer");
+        assert_eq!(
+            zeroclaw_api::turn_stop::turn_stop(&error)
+                .expect("marker-only exit must carry the typed stop")
+                .code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+        assert_eq!(
+            error.to_string(),
+            "Agent exceeded maximum tool iterations (2)"
         );
     }
 
